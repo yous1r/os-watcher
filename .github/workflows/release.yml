@@ -31,17 +31,15 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Node 20
+      - name: 安装 Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: web/package-lock.json
+          node-version: "22"
 
       - name: 构建前端面板
         run: |
           cd web
-          npm ci
+          npm install
           npm run build
 
       - name: 上传前端产物
