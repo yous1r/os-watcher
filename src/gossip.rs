@@ -128,6 +128,8 @@ impl GossipService {
         let gossip_tx = tx.clone();
 
         tokio::spawn(async move {
+            // Tick immediately so we push metrics as soon as there's something
+            // to send, rather than waiting the full interval.
             let mut interval = tokio::time::interval(
                 tokio::time::Duration::from_secs(gossip_interval_secs)
             );
@@ -211,6 +213,22 @@ impl GossipService {
             GossipMessage::NodeAnnounce(mut info) => {
                 info.status = NodeStatus::Online;
                 info.last_seen = Utc::now();
+
+                // If the peer advertised a wildcard bind address (0.0.0.0 / ::) as its
+                // gossip_addr, it hasn't applied the advertise_addr fix yet.  Replace the
+                // wildcard host with the actual UDP source IP so we have a routable address.
+                {
+                    let parts: Vec<&str> = info.gossip_addr.rsplitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        let host = parts[1];
+                        let port = parts[0];
+                        if host == "0.0.0.0" || host == "::" {
+                            info.gossip_addr = format!("{}:{}", src.ip(), port);
+                            debug!("Rewrote gossip_addr for {} to {}", info.hostname, info.gossip_addr);
+                        }
+                    }
+                }
+
                 debug!("Received announce from node {} ({})", info.hostname, info.id);
 
                 let should_sync = {
@@ -327,13 +345,20 @@ impl GossipService {
             GossipMessage::SyncResponse { from, nodes, metrics } => {
                 debug!("Sync response from {}, {} nodes", from, nodes.len());
                 let mut s = state.write().await;
+                let local_id = s.local_node.id;
                 for node in nodes {
-                    if !s.peers.contains_key(&node.id) {
+                    // Always update remote peers' info so we learn the real
+                    // gossip_addr / api_addr they advertise. Skip overwriting
+                    // our own entry so local status is authoritative.
+                    if node.id != local_id {
                         s.upsert_peer(node);
                     }
                 }
                 for (node_id, m) in metrics {
-                    if !s.metrics.contains_key(&node_id) {
+                    // Accept metrics for any node, including ones we already
+                    // know about — this is how we get initial data from peers
+                    // that started before us or whose metrics we missed.
+                    if node_id != local_id {
                         s.update_metrics(node_id, m);
                     }
                 }

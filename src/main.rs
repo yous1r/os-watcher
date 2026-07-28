@@ -149,8 +149,15 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
     let node_name = cfg.node.name.clone().unwrap_or_else(|| hostname.clone());
     let node_id = Uuid::new_v4();
 
+    // Resolve the address we advertise to other nodes.
+    // When bind_addr is 0.0.0.0 we must tell peers something routable;
+    // prefer the explicit advertise_addr, then auto-detect the outbound IP.
+    let advertise_host = resolve_advertise_addr(&cfg.network);
+
     let api_addr = format!("{}:{}", cfg.api.bind_addr, cfg.api.port);
-    let gossip_addr = format!("{}:{}", cfg.network.bind_addr, cfg.network.gossip_port);
+    // The gossip_addr we announce must be reachable by remote nodes, so use
+    // the resolved advertise address, not the wildcard bind address.
+    let gossip_addr = format!("{}:{}", advertise_host, cfg.network.gossip_port);
 
     let local_node = NodeInfo {
         id: node_id,
@@ -164,7 +171,8 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
 
     info!("Starting os-watcher node: {} ({})", node_name, node_id);
     info!("  API: http://{}", api_addr);
-    info!("  Gossip: udp://{}", gossip_addr);
+    info!("  Gossip (advertised): udp://{}", gossip_addr);
+    info!("  Gossip bind: udp://{}:{}", cfg.network.bind_addr, cfg.network.gossip_port);
     info!("  Peers configured: {}", cfg.network.peers.len());
 
     // Initialize shared state
@@ -266,7 +274,35 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
     Ok(())
 }
 
-/// Query a running agent's API and print status
+/// Determine the IP address to advertise in gossip messages.
+///
+/// Priority:
+/// 1. `network.advertise_addr` (explicitly configured)
+/// 2. Auto-detect by opening a UDP socket toward 8.8.8.8 (no packets sent)
+/// 3. Fall back to the bind_addr as-is
+fn resolve_advertise_addr(cfg: &crate::config::NetworkConfig) -> String {
+    if let Some(ref addr) = cfg.advertise_addr {
+        return addr.clone();
+    }
+
+    // If bind_addr is a specific IP (not 0.0.0.0 / ::), use it directly.
+    if cfg.bind_addr != "0.0.0.0" && cfg.bind_addr != "::" {
+        return cfg.bind_addr.clone();
+    }
+
+    // Auto-detect by observing which source address the OS selects when
+    // routing toward a public address. We use connect() on a UDP socket
+    // (no actual packet is sent) and inspect the local address.
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if sock.connect("8.8.8.8:80").is_ok() {
+            if let Ok(local) = sock.local_addr() {
+                return local.ip().to_string();
+            }
+        }
+    }
+
+    cfg.bind_addr.clone()
+}
 async fn run_status_check(api_base: &str) -> Result<()> {
     let client = reqwest::Client::new();
     let url = format!("{}/api/v1/metrics", api_base);

@@ -66,6 +66,12 @@ pub struct NetworkConfig {
     /// Bind address for network listener
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
+    /// Address advertised to peers (host only, no port).
+    /// Defaults to auto-detect when bind_addr is "0.0.0.0".
+    /// Set this explicitly when auto-detection picks the wrong interface
+    /// (e.g. multiple NICs, Docker bridge, VPN).
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +163,7 @@ impl Default for Config {
                 gossip_interval_secs: default_gossip_interval(),
                 max_hops: default_max_hops(),
                 bind_addr: default_bind_addr(),
+                advertise_addr: None,
             },
             api: ApiConfig {
                 port: default_api_port(),

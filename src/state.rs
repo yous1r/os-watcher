@@ -73,7 +73,11 @@ impl NodeState {
     /// Get list of peer gossip addresses (excluding self)
     pub fn peer_gossip_addrs(&self) -> Vec<String> {
         self.peers.values()
-            .filter(|p| p.id != self.local_node.id && p.status == NodeStatus::Online)
+            .filter(|p| p.id != self.local_node.id)
+            // Include Online and Unknown peers — Unknown means we just
+            // learned about them and haven't confirmed liveness yet, but
+            // we still want to attempt contact so they can sync back.
+            .filter(|p| p.status != NodeStatus::Offline)
             .map(|p| p.gossip_addr.clone())
             .collect()
     }
