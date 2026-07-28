@@ -164,7 +164,10 @@ impl MetricsCollector {
         }).collect();
 
         // --- Networks ---
-        let networks: Vec<NetworkInterface> = self.networks.iter().map(|(name, data)| {
+        use crate::disk_health::filter::is_physical_interface;
+        let networks: Vec<NetworkInterface> = self.networks.iter()
+            .filter(|(name, _)| is_physical_interface(name))
+            .map(|(name, data)| {
             let received = data.received();
             let transmitted = data.transmitted();
             NetworkInterface {
@@ -255,5 +258,38 @@ impl MetricsCollector {
 impl Default for MetricsCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::disk_health::filter::is_physical_interface;
+
+    #[test]
+    fn loopback_is_excluded() {
+        assert!(!is_physical_interface("lo"));
+        assert!(!is_physical_interface("Loopback Pseudo-Interface 1"));
+    }
+
+    #[test]
+    fn docker_bridge_is_excluded() {
+        assert!(!is_physical_interface("docker0"));
+        assert!(!is_physical_interface("br-abc123"));
+    }
+
+    #[test]
+    fn vpn_tunnels_are_excluded() {
+        assert!(!is_physical_interface("tun0"));
+        assert!(!is_physical_interface("wg0"));
+        assert!(!is_physical_interface("utun2"));
+    }
+
+    #[test]
+    fn physical_nics_are_kept() {
+        assert!(is_physical_interface("eth0"));
+        assert!(is_physical_interface("enp3s0"));
+        assert!(is_physical_interface("wlan0"));
+        assert!(is_physical_interface("Wi-Fi"));
+        assert!(is_physical_interface("以太网"));
     }
 }

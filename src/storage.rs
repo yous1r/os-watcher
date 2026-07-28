@@ -1,5 +1,6 @@
 use anyhow::Result;
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+use std::time::Duration;
 use chrono::Utc;
 use tracing::info;
 
@@ -20,6 +21,11 @@ impl Database {
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
+            // Release idle connections after 30 s so they don't accumulate.
+            .idle_timeout(Duration::from_secs(30))
+            // If all connections are busy, fail fast rather than blocking
+            // indefinitely — the caller logs the error and moves on.
+            .acquire_timeout(Duration::from_secs(5))
             .connect(&url)
             .await?;
 
