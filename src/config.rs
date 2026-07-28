@@ -11,6 +11,9 @@ pub struct Config {
     pub network: NetworkConfig,
     /// REST API settings
     pub api: ApiConfig,
+    /// Web dashboard settings
+    #[serde(default)]
+    pub web: WebConfig,
     /// Database settings
     pub storage: StorageConfig,
     /// Alert rules
@@ -87,6 +90,21 @@ pub struct ApiConfig {
     pub enabled: bool,
 }
 
+/// Web dashboard (static frontend) settings.
+///
+/// Disabled by default so plain agent nodes never try to serve a bundle they
+/// do not ship. The `full` release package enables it in its example config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebConfig {
+    /// Serve the built web dashboard alongside the API.
+    /// The `--web` CLI flag turns this on regardless of the config value.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory holding the built frontend assets
+    #[serde(default = "default_web_dir")]
+    pub dir: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     /// SQLite database file path
@@ -137,6 +155,7 @@ fn default_gossip_interval() -> u64 { 10 }
 fn default_max_hops() -> u8 { 3 }
 fn default_bind_addr() -> String { "0.0.0.0".to_string() }
 fn default_api_port() -> u16 { 7980 }
+fn default_web_dir() -> String { "web/dist".to_string() }
 fn default_db_path() -> String { "os-watcher.db".to_string() }
 fn default_retention_hours() -> u64 { 168 } // 7 days
 fn default_tui_refresh_ms() -> u64 { 1000 }
@@ -170,6 +189,7 @@ impl Default for Config {
                 bind_addr: default_bind_addr(),
                 enabled: true,
             },
+            web: WebConfig::default(),
             storage: StorageConfig {
                 db_path: default_db_path(),
                 retention_hours: default_retention_hours(),
@@ -212,6 +232,15 @@ impl Default for TuiConfig {
     }
 }
 
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: default_web_dir(),
+        }
+    }
+}
+
 /// Load config from a TOML file, falling back to defaults
 pub fn load_config(path: &str) -> anyhow::Result<Config> {
     let content = std::fs::read_to_string(path)?;
@@ -219,63 +248,74 @@ pub fn load_config(path: &str) -> anyhow::Result<Config> {
     Ok(config)
 }
 
-/// Generate a default config file
-pub fn generate_default_config() -> String {
-    r#"# os-watcher configuration
+/// Which release flavour a config template targets.
+///
+/// The release pipeline ships a different example config per package, so the
+/// defaults a user starts from match what their package can actually do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ConfigProfile {
+    /// Collect-only node without a bundled dashboard (`os-watcher-*-node`)
+    Node,
+    /// Node that also serves the web dashboard (`os-watcher-*-full`)
+    Full,
+}
 
-[node]
-# name = "my-server"  # defaults to hostname
-role = "both"  # "agent", "server", or "both"
+/// Example config shipped in the `-node` release package.
+pub const NODE_CONFIG_TEMPLATE: &str = include_str!("../config.node.example.toml");
+/// Example config shipped in the `-full` release package.
+pub const FULL_CONFIG_TEMPLATE: &str = include_str!("../config.full.example.toml");
 
-[metrics]
-collect_interval_secs = 5
-top_processes_count = 10
-collect_processes = true
+/// Generate the default config file contents for a release profile.
+pub fn generate_default_config(profile: ConfigProfile) -> String {
+    match profile {
+        ConfigProfile::Node => NODE_CONFIG_TEMPLATE.to_string(),
+        ConfigProfile::Full => FULL_CONFIG_TEMPLATE.to_string(),
+    }
+}
 
-[network]
-gossip_port = 7979
-enable_discovery = true
-peers = []  # add peers manually: ["192.168.1.10:7979", "192.168.1.11:7979"]
-announce_interval_secs = 30
-gossip_interval_secs = 10
-max_hops = 3
-bind_addr = "0.0.0.0"
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-[api]
-port = 7980
-bind_addr = "0.0.0.0"
-enabled = true
+    fn parse(template: &str) -> Config {
+        toml::from_str(template).expect("template must be valid config TOML")
+    }
 
-[storage]
-db_path = "os-watcher.db"
-retention_hours = 168  # 7 days
+    #[test]
+    fn node_template_disables_web_dashboard() {
+        let cfg = parse(NODE_CONFIG_TEMPLATE);
+        assert!(!cfg.web.enabled, "node package ships no frontend bundle");
+        assert!(cfg.api.enabled, "API stays on for local status checks");
+    }
 
-[tui]
-refresh_ms = 1000
+    #[test]
+    fn full_template_enables_web_dashboard() {
+        let cfg = parse(FULL_CONFIG_TEMPLATE);
+        assert!(cfg.web.enabled);
+        // Must match the directory name the pipeline unpacks the bundle into.
+        assert_eq!(cfg.web.dir, "web-dist");
+    }
 
-# Alert rules
-[[alerts]]
-name = "high_cpu"
-metric = "cpu"
-operator = "gt"
-threshold = 90.0
-consecutive_violations = 3
-severity = "warning"
+    #[test]
+    fn profiles_generate_distinct_configs() {
+        let node = generate_default_config(ConfigProfile::Node);
+        let full = generate_default_config(ConfigProfile::Full);
+        assert_ne!(node, full);
+    }
 
-[[alerts]]
-name = "high_memory"
-metric = "memory"
-operator = "gt"
-threshold = 90.0
-consecutive_violations = 2
-severity = "warning"
-
-[[alerts]]
-name = "disk_almost_full"
-metric = "disk"
-operator = "gt"
-threshold = 85.0
-consecutive_violations = 1
-severity = "critical"
-"#.to_string()
+    #[test]
+    fn web_disabled_when_section_absent() {
+        // Configs written before the [web] section existed must still load.
+        let cfg: Config = toml::from_str(
+            r#"
+            [node]
+            [metrics]
+            [network]
+            [api]
+            [storage]
+            "#,
+        )
+        .expect("legacy config without [web] should parse");
+        assert!(!cfg.web.enabled);
+    }
 }

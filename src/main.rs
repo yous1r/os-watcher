@@ -19,7 +19,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 use anyhow::Result;
 
-use crate::config::{Config, load_config, generate_default_config};
+use crate::config::{Config, ConfigProfile, load_config, generate_default_config};
 use crate::collector::MetricsCollector;
 use crate::gossip::GossipService;
 use crate::state::new_shared_state;
@@ -60,15 +60,21 @@ enum Commands {
         /// Run in TUI mode
         #[arg(long, short)]
         tui: bool,
-        /// Serve the web dashboard (static frontend) alongside the API
+        /// Serve the web dashboard (static frontend) alongside the API.
+        /// Overrides `web.enabled = false` in the config file.
         #[arg(long)]
         web: bool,
-        /// Directory of built web assets (defaults to "web/dist")
-        #[arg(long, default_value = "web/dist")]
-        web_dir: String,
+        /// Directory of built web assets (defaults to `web.dir` from the config)
+        #[arg(long)]
+        web_dir: Option<String>,
     },
     /// Print default configuration to stdout
-    GenConfig,
+    GenConfig {
+        /// Which package flavour to generate defaults for:
+        /// "node" (collect only) or "full" (also serves the dashboard)
+        #[arg(long, value_enum, default_value = "node")]
+        profile: ConfigProfile,
+    },
     /// Show status of all known nodes (requires a running agent)
     Status {
         /// Agent API address
@@ -97,10 +103,10 @@ async fn main() -> Result<()> {
         peers: None,
         tui: false,
         web: false,
-        web_dir: "web/dist".to_string(),
+        web_dir: None,
     }) {
-        Commands::GenConfig => {
-            print!("{}", generate_default_config());
+        Commands::GenConfig { profile } => {
+            print!("{}", generate_default_config(profile));
         }
 
         Commands::Status { api } => {
@@ -135,8 +141,17 @@ async fn main() -> Result<()> {
                 cfg.network.peers.extend(extra);
             }
 
-            // Resolve web dashboard directory: enabled only with --web.
-            let web_dir = if web { Some(web_dir) } else { None };
+            // Resolve the web dashboard directory. The dashboard is on when
+            // either the config enables it (the `full` package default) or
+            // `--web` is passed; `--web-dir` overrides the configured path.
+            if let Some(dir) = web_dir {
+                cfg.web.dir = dir;
+            }
+            let web_dir = if web || cfg.web.enabled {
+                Some(cfg.web.dir.clone())
+            } else {
+                None
+            };
 
             run_agent(cfg, use_tui, web_dir).await?;
         }

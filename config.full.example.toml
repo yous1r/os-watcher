@@ -1,0 +1,67 @@
+# os-watcher 配置示例 —— 带 Web 面板的节点（full）
+#
+# 适用于对外提供 Web 面板与聚合视图的机器（对应发布包 os-watcher-*-full）。
+# 复制为 config.toml 后按需修改；所有字段均有默认值，可只保留需要覆盖的项。
+
+[node]
+# name = "os-watcher-dashboard"   # 节点名称，默认使用主机名
+role = "both"           # 既采集本机指标，也聚合其它节点数据
+
+[metrics]
+collect_interval_secs = 5      # 采集间隔（秒）
+top_processes_count = 20       # 面板要展示进程排行，多留一些
+collect_processes = true       # 是否采集进程级指标
+
+[network]
+gossip_port = 7979              # Gossip/发现使用的 UDP 端口
+enable_discovery = true         # 是否启用局域网广播自动发现
+peers = []                      # 手动指定对等节点：["192.168.1.10:7979", "192.168.1.11:7979"]
+announce_interval_secs = 30     # 广播自身存在的间隔（秒）
+gossip_interval_secs = 5        # 面板节点更频繁地拉取指标，界面更实时
+max_hops = 3                    # Gossip 消息最大转发跳数
+bind_addr = "0.0.0.0"           # 网络监听地址
+# advertise_addr = "192.168.1.10"  # 多网卡/容器环境下手动指定对外通告的 IP
+
+[api]
+port = 7980                     # REST API / Web 面板端口
+bind_addr = "0.0.0.0"           # API 监听地址
+enabled = true                  # 面板依赖 API，必须开启
+
+# ---- Web 面板 ----
+# 注意：面板与 API 监听同一端口，且当前没有内置鉴权。
+# 暴露到公网前请在前面加反向代理并配置访问控制，或把 api.bind_addr 收窄到内网地址。
+[web]
+enabled = true                  # 开启后无需命令行 --web
+dir = "web-dist"                # 发布包内前端静态资源目录
+
+[storage]
+db_path = "os-watcher.db"       # SQLite 数据库文件路径
+retention_hours = 720           # 面板节点保留 30 天历史，供趋势图查询
+
+[tui]
+refresh_ms = 1000               # 终端面板刷新间隔（毫秒）
+
+# ---- 告警规则 ----
+[[alerts]]
+name = "high_cpu"
+metric = "cpu"                  # cpu / memory / swap / disk / load1 / load5 / load15
+operator = "gt"                 # gt / lt / gte / lte / eq
+threshold = 90.0
+consecutive_violations = 3      # 连续违规多少次后触发
+severity = "warning"            # info / warning / critical
+
+[[alerts]]
+name = "high_memory"
+metric = "memory"
+operator = "gt"
+threshold = 90.0
+consecutive_violations = 2
+severity = "warning"
+
+[[alerts]]
+name = "disk_almost_full"
+metric = "disk"
+operator = "gt"
+threshold = 85.0
+consecutive_violations = 1
+severity = "critical"
