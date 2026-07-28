@@ -1,0 +1,173 @@
+# Gitea Actions —— 推送 tag 时构建并发布 release
+#
+# 触发条件：推送形如 v1.2.3 的 tag
+# 产物（每个平台输出两种包）：
+#   os-watcher-{platform}-node.tar.gz  —— 仅节点二进制，不含 Web 面板
+#   os-watcher-{platform}-full.tar.gz  —— 二进制 + web/dist 前端面板
+#
+# 注意：
+#   - Gitea Actions 与 GitHub Actions 语法高度兼容，但 actions/* 版本可能受 runner 限制
+#   - akkuman/gitea-release-action 使用 GITEA_TOKEN（内置），不是 GITHUB_TOKEN
+#   - runner 需要 ubuntu-latest 标签，或自行修改为已注册的 runner 标签
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------------ #
+  #  构建前端面板（一次，产物供各平台复用）                              #
+  # ------------------------------------------------------------------ #
+  build-web:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 构建前端面板
+        run: |
+          cd web
+          npm ci
+          npm run build
+
+      - name: 上传前端产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
+  # ------------------------------------------------------------------ #
+  #  多平台构建后端二进制                                               #
+  # ------------------------------------------------------------------ #
+  build:
+    needs: build-web
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+            linker: ""
+            cc: ""
+          - target: x86_64-unknown-linux-musl
+            platform: linux-x86_64-musl
+            linker: ""
+            cc: ""
+          - target: aarch64-unknown-linux-gnu
+            platform: linux-aarch64
+            linker: aarch64-linux-gnu-gcc
+            cc: aarch64-linux-gnu-gcc
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 稳定版 + 目标
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      - name: 安装交叉编译系统依赖
+        run: |
+          sudo apt-get update -qq
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              sudo apt-get install -y musl-tools ;;
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y gcc-aarch64-linux-gnu ;;
+          esac
+
+      - name: 构建 release 二进制
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.cc }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: 下载前端产物
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - name: 打包 node 版（仅二进制）
+        run: |
+          DIST="os-watcher-${{ matrix.platform }}-node"
+          mkdir -p "$DIST"
+          cp "target/${{ matrix.target }}/release/os-watcher" "$DIST/"
+          cp README.md          "$DIST/" 2>/dev/null || true
+          cp config.example.toml "$DIST/" 2>/dev/null || true
+          cp deploy.sh          "$DIST/" 2>/dev/null || true
+          tar -czf "${DIST}.tar.gz" "$DIST"
+          sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
+
+      - name: 打包 full 版（二进制 + Web 面板）
+        run: |
+          DIST="os-watcher-${{ matrix.platform }}-full"
+          mkdir -p "$DIST"
+          cp "target/${{ matrix.target }}/release/os-watcher" "$DIST/"
+          cp README.md          "$DIST/" 2>/dev/null || true
+          cp config.example.toml "$DIST/" 2>/dev/null || true
+          cp deploy.sh          "$DIST/" 2>/dev/null || true
+          cp -r web/dist        "$DIST/web-dist"
+          tar -czf "${DIST}.tar.gz" "$DIST"
+          sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
+
+      - name: 上传两种产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform }}
+          path: |
+            os-watcher-${{ matrix.platform }}-node.tar.gz
+            os-watcher-${{ matrix.platform }}-node.tar.gz.sha256
+            os-watcher-${{ matrix.platform }}-full.tar.gz
+            os-watcher-${{ matrix.platform }}-full.tar.gz.sha256
+          retention-days: 1
+
+  # ------------------------------------------------------------------ #
+  #  汇总产物并创建 Gitea Release                                       #
+  # ------------------------------------------------------------------ #
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载所有平台产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: release/
+          merge-multiple: true
+
+      - name: 校验文件列表
+        run: ls -lh release/
+
+      - name: 创建 Gitea Release 并上传文件
+        uses: akkuman/gitea-release-action@v1
+        with:
+          # GITEA_TOKEN 是 Gitea Actions 的内置 token（对应 GitHub 的 GITHUB_TOKEN）
+          token: ${{ secrets.GITEA_TOKEN }}
+          files: |-
+            release/*.tar.gz
+            release/*.sha256
