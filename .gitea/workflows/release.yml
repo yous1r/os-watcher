@@ -5,6 +5,10 @@
 #   os-watcher-{platform}-node.tar.gz  —— 仅节点二进制，不含 Web 面板
 #   os-watcher-{platform}-full.tar.gz  —— 二进制 + web/dist 前端面板
 #
+# 两种包的 config.example.toml 来自不同模板，默认值不同：
+#   node → config.node.example.toml（web.enabled = false，role = "agent"）
+#   full → config.full.example.toml（web.enabled = true，web.dir = "web-dist"）
+#
 # 注意：
 #   - Gitea Actions 与 GitHub Actions 语法高度兼容，但 actions/* 版本可能受 runner 限制
 #   - akkuman/gitea-release-action 使用 GITEA_TOKEN（内置），不是 GITHUB_TOKEN
@@ -112,25 +116,27 @@ jobs:
           name: web-dist
           path: web/dist/
 
+      # node 包：配置默认 web.enabled = false，不含前端资源
       - name: 打包 node 版（仅二进制）
         run: |
           DIST="os-watcher-${{ matrix.platform }}-node"
           mkdir -p "$DIST"
           cp "target/${{ matrix.target }}/release/os-watcher" "$DIST/"
           cp README.md          "$DIST/" 2>/dev/null || true
-          cp config.example.toml "$DIST/" 2>/dev/null || true
           cp deploy.sh          "$DIST/" 2>/dev/null || true
+          cp config.node.example.toml "$DIST/config.example.toml"
           tar -czf "${DIST}.tar.gz" "$DIST"
           sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
 
+      # full 包：配置默认 web.enabled = true 且 web.dir = "web-dist"，开箱即用
       - name: 打包 full 版（二进制 + Web 面板）
         run: |
           DIST="os-watcher-${{ matrix.platform }}-full"
           mkdir -p "$DIST"
           cp "target/${{ matrix.target }}/release/os-watcher" "$DIST/"
           cp README.md          "$DIST/" 2>/dev/null || true
-          cp config.example.toml "$DIST/" 2>/dev/null || true
           cp deploy.sh          "$DIST/" 2>/dev/null || true
+          cp config.full.example.toml "$DIST/config.example.toml"
           cp -r web/dist        "$DIST/web-dist"
           tar -czf "${DIST}.tar.gz" "$DIST"
           sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"

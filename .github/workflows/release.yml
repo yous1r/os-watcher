@@ -5,6 +5,10 @@
 #   os-watcher-{platform}-node.{tar.gz|zip}  —— 仅节点二进制，不含 Web 面板
 #   os-watcher-{platform}-full.{tar.gz|zip}  —— 二进制 + web/dist 前端面板
 #
+# 两种包的 config.example.toml 来自不同模板，默认值不同：
+#   node → config.node.example.toml（web.enabled = false，role = "agent"）
+#   full → config.full.example.toml（web.enabled = true，web.dir = "web-dist"）
+#
 # 目标平台：
 #   linux-x86_64        x86_64-unknown-linux-gnu
 #   linux-x86_64-musl   x86_64-unknown-linux-musl  (全静态，适合无 glibc 环境)
@@ -113,25 +117,27 @@ jobs:
           name: web-dist
           path: web/dist/
 
+      # node 包：配置默认 web.enabled = false，不含前端资源
       - name: 打包 node 版（仅二进制）
         run: |
           DIST="os-watcher-${{ matrix.platform }}-node"
           mkdir -p "$DIST"
           cp "target/${{ matrix.target }}/release/os-watcher" "$DIST/"
           cp README.md     "$DIST/" 2>/dev/null || true
-          cp config.example.toml "$DIST/" 2>/dev/null || true
           cp deploy.sh     "$DIST/" 2>/dev/null || true
+          cp config.node.example.toml "$DIST/config.example.toml"
           tar -czf "${DIST}.tar.gz" "$DIST"
           sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
 
+      # full 包：配置默认 web.enabled = true 且 web.dir = "web-dist"，开箱即用
       - name: 打包 full 版（二进制 + Web 面板）
         run: |
           DIST="os-watcher-${{ matrix.platform }}-full"
           mkdir -p "$DIST"
           cp "target/${{ matrix.target }}/release/os-watcher" "$DIST/"
           cp README.md     "$DIST/" 2>/dev/null || true
-          cp config.example.toml "$DIST/" 2>/dev/null || true
           cp deploy.sh     "$DIST/" 2>/dev/null || true
+          cp config.full.example.toml "$DIST/config.example.toml"
           cp -r web/dist   "$DIST/web-dist"
           tar -czf "${DIST}.tar.gz" "$DIST"
           sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
@@ -185,8 +191,8 @@ jobs:
           $dist = "os-watcher-windows-x86_64-node"
           New-Item -ItemType Directory -Path $dist | Out-Null
           Copy-Item "target\release\os-watcher.exe" "$dist\"
-          if (Test-Path README.md)          { Copy-Item README.md          "$dist\" }
-          if (Test-Path config.example.toml){ Copy-Item config.example.toml "$dist\" }
+          if (Test-Path README.md) { Copy-Item README.md "$dist\" }
+          Copy-Item config.node.example.toml "$dist\config.example.toml"
           Compress-Archive -Path $dist -DestinationPath "$dist.zip"
           $hash = (Get-FileHash "$dist.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $dist.zip" | Out-File "$dist.zip.sha256" -Encoding ASCII
@@ -197,8 +203,8 @@ jobs:
           $dist = "os-watcher-windows-x86_64-full"
           New-Item -ItemType Directory -Path $dist | Out-Null
           Copy-Item "target\release\os-watcher.exe" "$dist\"
-          if (Test-Path README.md)          { Copy-Item README.md          "$dist\" }
-          if (Test-Path config.example.toml){ Copy-Item config.example.toml "$dist\" }
+          if (Test-Path README.md) { Copy-Item README.md "$dist\" }
+          Copy-Item config.full.example.toml "$dist\config.example.toml"
           Copy-Item web\dist "$dist\web-dist" -Recurse
           Compress-Archive -Path $dist -DestinationPath "$dist.zip"
           $hash = (Get-FileHash "$dist.zip" -Algorithm SHA256).Hash.ToLower()
