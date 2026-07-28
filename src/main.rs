@@ -2,6 +2,7 @@ mod types;
 mod config;
 mod collector;
 mod diskstats;
+mod disk_health;
 mod state;
 mod gossip;
 mod api;

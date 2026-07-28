@@ -9,14 +9,12 @@
 //! If `smartctl` is missing or lacks permission, everything degrades to
 //! `None` — SMART is treated as optional enrichment, never a hard dependency.
 
-use std::collections::HashMap;
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::Value;
-use tracing::{debug, warn};
 
+use crate::disk_health::DiskHealthCollector;
 use crate::types::{SmartAttribute, SmartHealth, SmartInfo};
 
 /// Attribute IDs worth surfacing rather than dumping all ~30 attributes.
@@ -38,107 +36,40 @@ const NOTABLE_ATTRIBUTE_IDS: &[u8] = &[
     233, // Media_Wearout_Indicator
 ];
 
-/// Caches SMART data and refreshes it on a slow interval.
+/// Wraps `DiskHealthCollector` with a stable public interface so callers in
+/// `collector.rs` don't need to know about the underlying implementation.
 pub struct SmartCollector {
-    /// Physical device path -> last successful reading.
-    cache: HashMap<String, SmartInfo>,
-    /// When the cache was last refreshed.
-    last_refresh: Option<Instant>,
-    /// How long a cached reading stays valid.
-    interval: Duration,
-    /// Set once we know `smartctl` is unusable, to stop retrying every cycle.
-    unavailable: bool,
+    inner: DiskHealthCollector,
 }
 
 impl SmartCollector {
     /// Create a collector that refreshes at most every `interval_secs`.
     pub fn new(interval_secs: u64) -> Self {
         Self {
-            cache: HashMap::new(),
-            last_refresh: None,
-            interval: Duration::from_secs(interval_secs.max(60)),
-            unavailable: false,
+            inner: DiskHealthCollector::new(interval_secs),
         }
     }
 
-    /// Whether the cache is due for a refresh.
-    fn is_stale(&self) -> bool {
-        match self.last_refresh {
-            None => true,
-            Some(t) => t.elapsed() >= self.interval,
-        }
-    }
-
-    /// Refresh the cache if it is stale. Cheap no-op otherwise, so this is
-    /// safe to call from the regular collection loop.
+    /// Refresh the cache if it is stale. Cheap no-op otherwise.
     pub fn refresh_if_due(&mut self) {
-        if self.unavailable || !self.is_stale() {
-            return;
-        }
-
-        self.last_refresh = Some(Instant::now());
-
-        let devices = match scan_devices() {
-            Ok(d) => d,
-            Err(e) => {
-                // smartctl absent or unusable: log once, then stay quiet.
-                warn!("SMART collection disabled: {}", e);
-                self.unavailable = true;
-                return;
-            }
-        };
-
-        if devices.is_empty() {
-            debug!("SMART scan found no devices");
-            return;
-        }
-
-        for device in devices {
-            match query_device(&device) {
-                Ok(info) => {
-                    self.cache.insert(device, info);
-                }
-                Err(e) => {
-                    debug!("SMART query failed for {}: {}", device, e);
-                }
-            }
-        }
-
-        debug!("SMART cache refreshed: {} device(s)", self.cache.len());
+        self.inner.refresh_if_due();
     }
 
     /// Look up cached SMART data for the physical device backing a disk.
-    ///
-    /// `disk_name` is the value reported by `sysinfo` (e.g. `/dev/sda1`,
-    /// `/dev/nvme0n1p2`), which is usually a partition — this maps it back to
-    /// the parent device that SMART is reported against.
     pub fn lookup(&self, disk_name: &str) -> Option<SmartInfo> {
-        if self.cache.is_empty() {
-            return None;
-        }
-
-        // Exact match first.
-        if let Some(info) = self.cache.get(disk_name) {
-            return Some(info.clone());
-        }
-
-        // Otherwise reduce the partition to its parent device and match that.
-        let parent = parent_device(disk_name);
-        if let Some(info) = self.cache.get(&parent) {
-            return Some(info.clone());
-        }
-
-        // Last resort: a cached device that prefixes this disk's name.
-        self.cache
-            .iter()
-            .find(|(dev, _)| disk_name.starts_with(dev.as_str()))
-            .map(|(_, info)| info.clone())
+        self.inner.lookup(disk_name)
     }
 
     /// Devices currently held in the cache.
     pub fn devices(&self) -> Vec<&SmartInfo> {
-        self.cache.values().collect()
+        self.inner.devices()
     }
+}
+
+/// Expose `parse_smart_json` at crate visibility so `disk_health::mod` can
+/// reuse it without duplicating the parsing logic.
+pub(crate) fn parse_smart_json_pub(device: &str, json: &Value) -> Option<SmartInfo> {
+    Some(parse_smart_json(device, json))
 }
 
 /// Reduce a partition path to the physical device SMART reports against.
