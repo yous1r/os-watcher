@@ -26,7 +26,7 @@ fn smartctl_available() -> bool {
 
 /// Reduce a partition path to the parent physical device.
 /// `/dev/sda1` → `/dev/sda`, `/dev/nvme0n1p2` → `/dev/nvme0n1`
-fn parent_device(name: &str) -> String {
+pub(crate) fn parent_device(name: &str) -> String {
     let trimmed = name.trim_end_matches(|c: char| c.is_ascii_digit());
     if trimmed.ends_with('p') && trimmed.contains("nvme") {
         return trimmed[..trimmed.len() - 1].to_string();
@@ -99,6 +99,12 @@ impl DiskHealthCollector {
     /// Devices currently held in the cache.
     pub fn devices(&self) -> Vec<&SmartInfo> {
         self.cache.values().collect()
+    }
+
+    /// 缓存的完整快照：设备标识 → SmartInfo 克隆。
+    /// collector 用它作为物理盘列表的来源。
+    pub fn snapshot(&self) -> std::collections::HashMap<String, SmartInfo> {
+        self.cache.clone()
     }
 
     #[cfg(target_os = "linux")]
