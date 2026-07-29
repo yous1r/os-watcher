@@ -64,6 +64,11 @@ impl SmartCollector {
     pub fn devices(&self) -> Vec<&SmartInfo> {
         self.inner.devices()
     }
+
+    /// 缓存的完整快照：设备标识 → SmartInfo。
+    pub fn snapshot(&self) -> std::collections::HashMap<String, SmartInfo> {
+        self.inner.snapshot()
+    }
 }
 
 /// Expose `parse_smart_json` at crate visibility so `disk_health::mod` can
