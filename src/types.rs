@@ -68,6 +68,59 @@ pub struct DiskInfo {
     pub smart: Option<SmartInfo>,
 }
 
+/// 物理盘的介质类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiskType {
+    /// 机械硬盘
+    Hdd,
+    /// SATA/SAS 固态盘
+    Ssd,
+    /// NVMe 固态盘
+    Nvme,
+    /// 无法判定
+    Unknown,
+}
+
+/// 物理盘上的一个分区/挂载点
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Partition {
+    /// 分区设备名或盘符，如 "/dev/nvme0n1p2"、"C:\\"
+    pub name: String,
+    /// 挂载点
+    pub mount_point: String,
+    /// 文件系统类型
+    pub fs_type: String,
+    /// 总容量（字节）
+    pub total_bytes: u64,
+    /// 已用容量（字节）
+    pub used_bytes: u64,
+    /// 使用率（0-100）
+    pub usage_percent: f32,
+}
+
+/// 一块物理磁盘及其上的分区
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhysicalDisk {
+    /// 物理设备路径/标识，如 "/dev/nvme0n1"、"disk0"——悬浮时展示
+    pub device: String,
+    /// 型号，主标题；拿不到时前端回退到设备名
+    pub model: Option<String>,
+    /// 介质类型
+    pub disk_type: DiskType,
+    /// 整盘物理容量（字节）；未知时为 0
+    pub total_bytes: u64,
+    /// SMART 健康数据（复用已有结构），无则 None
+    pub smart: Option<SmartInfo>,
+    /// 整盘读速率（字节/秒）
+    pub read_bytes_per_sec: f64,
+    /// 整盘写速率（字节/秒）
+    pub write_bytes_per_sec: f64,
+    /// I/O 是否为该盘真实计数（true）还是全机聚合（false）
+    pub per_device_io: bool,
+    /// 该盘上的分区/挂载点
+    pub partitions: Vec<Partition>,
+}
+
 /// Overall SMART health assessment reported by the device
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SmartHealth {
@@ -194,6 +247,9 @@ pub struct SystemMetrics {
     pub cpu: CpuMetrics,
     pub memory: MemoryMetrics,
     pub disks: Vec<DiskInfo>,
+    /// 物理磁盘视图（每块盘含其分区）。新增字段，旧节点数据缺失时为空。
+    #[serde(default)]
+    pub physical_disks: Vec<PhysicalDisk>,
     pub networks: Vec<NetworkInterface>,
     pub load_average: Option<LoadAverage>,
     /// Top processes by CPU usage
