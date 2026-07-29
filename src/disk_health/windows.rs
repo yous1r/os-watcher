@@ -57,6 +57,88 @@ Get-PhysicalDisk | ForEach-Object {
     }
 }
 
+/// 查询盘符→物理盘号的映射。
+///
+/// `Get-Partition` 给出 DriveLetter 与 DiskNumber，据此把 sysinfo 报的盘符
+/// （`C:\`）对应到 `Get-PhysicalDisk` 的 DeviceId（`disk0`）。
+pub fn query_partition_map() -> std::collections::HashMap<String, String> {
+    let script = r#"
+Get-Partition | Where-Object { $_.DriveLetter } | ForEach-Object {
+  [PSCustomObject]@{
+    DriveLetter = [string]$_.DriveLetter
+    DiskNumber  = $_.DiskNumber
+  }
+} | ConvertTo-Json -Compress
+"#;
+
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            parse_partition_map(&text)
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!("PowerShell partition query failed: {}", err.trim());
+            std::collections::HashMap::new()
+        }
+        Err(e) => {
+            tracing::warn!("Could not run PowerShell: {}", e);
+            std::collections::HashMap::new()
+        }
+    }
+}
+
+/// 一条 Get-Partition 结果。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PartitionRow {
+    drive_letter: Option<String>,
+    disk_number: Option<u32>,
+}
+
+/// 解析 Get-Partition 的 JSON，返回 `"C:\\"` → `"disk0"` 映射。
+/// 单对象与数组两种形态都处理，无盘符或无盘号的行跳过。
+pub(crate) fn parse_partition_map(text: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+
+    let json_text = text.trim();
+    if json_text.is_empty() {
+        return map;
+    }
+    let normalised = if json_text.starts_with('{') {
+        format!("[{}]", json_text)
+    } else {
+        json_text.to_string()
+    };
+
+    let rows: Vec<PartitionRow> = match serde_json::from_str(&normalised) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Failed to parse partition JSON: {}", e);
+            return map;
+        }
+    };
+
+    for row in rows {
+        let (Some(letter), Some(num)) = (row.drive_letter, row.disk_number) else {
+            continue;
+        };
+        let letter = letter.trim();
+        if letter.is_empty() {
+            continue;
+        }
+        // sysinfo 报的挂载点形如 "C:\"，统一成该形态作为 key。
+        let mount = format!("{}:\\", letter);
+        map.insert(mount, format!("disk{}", num));
+    }
+
+    map
+}
+
 /// Parse PowerShell JSON — handles both a single object and an array.
 pub(crate) fn parse_wmi_json(text: &str) -> std::collections::HashMap<String, SmartInfo> {
     let mut map = std::collections::HashMap::new();
@@ -197,6 +279,35 @@ mod tests {
     #[test]
     fn invalid_json_returns_empty_map() {
         let map = parse_wmi_json("not json at all");
+        assert!(map.is_empty());
+    }
+
+    const PARTITION_MAP_JSON: &str = r#"[
+        {"DriveLetter":"C","DiskNumber":0},
+        {"DriveLetter":"D","DiskNumber":0},
+        {"DriveLetter":"E","DiskNumber":1}
+    ]"#;
+
+    #[test]
+    fn parses_drive_letter_to_disk_number() {
+        let map = parse_partition_map(PARTITION_MAP_JSON);
+        assert_eq!(map.get("C:\\"), Some(&"disk0".to_string()));
+        assert_eq!(map.get("D:\\"), Some(&"disk0".to_string()));
+        assert_eq!(map.get("E:\\"), Some(&"disk1".to_string()));
+    }
+
+    #[test]
+    fn partition_map_handles_single_object() {
+        let json = r#"{"DriveLetter":"C","DiskNumber":0}"#;
+        let map = parse_partition_map(json);
+        assert_eq!(map.get("C:\\"), Some(&"disk0".to_string()));
+    }
+
+    #[test]
+    fn partition_map_skips_null_drive_letter() {
+        // 无盘符的分区（恢复分区等）应被跳过。
+        let json = r#"[{"DriveLetter":null,"DiskNumber":0}]"#;
+        let map = parse_partition_map(json);
         assert!(map.is_empty());
     }
 }
