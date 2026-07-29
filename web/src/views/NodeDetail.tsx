@@ -1,6 +1,6 @@
 import { createSignal, createMemo, For, Show, createEffect } from "solid-js";
 import { Select, createListCollection } from "@ark-ui/solid/select";
-import type { NodeSnapshot, ProcessInfo } from "../types";
+import type { NodeSnapshot, ProcessInfo, PhysicalDisk, DiskType } from "../types";
 import { formatBytes, formatRate, formatUptime, usageTone } from "../format";
 
 /** 进程表格的排序维度。 */
@@ -34,6 +34,26 @@ function sortValue(p: ProcessInfo, key: SortKey): number {
     case "disk_write":
       return p.disk_write_bps;
   }
+}
+
+/** 盘类型徽章文案。 */
+function diskTypeLabel(t: DiskType): string {
+  switch (t) {
+    case "Hdd": return "HDD";
+    case "Ssd": return "SSD";
+    case "Nvme": return "NVMe";
+    default: return "未知";
+  }
+}
+
+/** 卡片主标题：型号优先，缺失时回退设备名。 */
+function diskTitle(d: PhysicalDisk): string {
+  return d.model ?? d.device;
+}
+
+/** 悬浮 tooltip：完整型号 + 设备名。 */
+function diskTooltip(d: PhysicalDisk): string {
+  return d.model ? `${d.model} (${d.device})` : d.device;
 }
 
 /** 节点详情视图：选择单个节点，展示 CPU/内存/磁盘/网络/进程详情。 */
@@ -146,35 +166,18 @@ export function NodeDetail(props: { snapshots: NodeSnapshot[] }) {
             <div class="detail-cols">
               <div class="panel">
                 <h3>磁盘</h3>
-                <For each={metrics().disks}>
-                  {(d) => {
-                    const tone = usageTone(d.usage_percent);
-                    return (
-                      <div class="disk-row">
-                        <div class="disk-mount">{d.mount_point}</div>
-                        <div class="bar">
-                          <div
-                            class="bar-fill"
-                            classList={{ [tone]: true }}
-                            style={{ width: `${Math.min(d.usage_percent, 100)}%` }}
-                          />
-                        </div>
-                        <div class="disk-detail">
-                          {formatBytes(d.used_bytes)} / {formatBytes(d.total_bytes)} ({d.usage_percent.toFixed(0)}%)
-                        </div>
-                        <div class="disk-io">
-                          <span>读 {formatRate(d.read_bytes_per_sec)}</span>
-                          <span>写 {formatRate(d.write_bytes_per_sec)}</span>
-                          {/* 非 Linux 平台拿不到按盘计数，标注出来避免误读为单盘数据 */}
-                          <Show when={!d.per_device_io}>
-                            <span class="io-note" title="内核未提供按设备计数，此处为全机聚合值">
-                              全机
-                            </span>
-                          </Show>
-                        </div>
-                        <Show when={d.smart}>
-                          {(s) => (
-                            <div class="disk-smart">
+                <For each={metrics().physical_disks}>
+                  {(disk) => (
+                    <div
+                      class="disk-card"
+                      classList={{ crit: disk.smart?.health === "Failed" }}
+                    >
+                      <div class="disk-card-head" title={diskTooltip(disk)}>
+                        <span class="disk-model">{diskTitle(disk)}</span>
+                        <span class="disk-badges">
+                          <span class="disk-type-badge">{diskTypeLabel(disk.disk_type)}</span>
+                          <Show when={disk.smart}>
+                            {(s) => (
                               <span
                                 class="smart-health"
                                 classList={{
@@ -183,32 +186,66 @@ export function NodeDetail(props: { snapshots: NodeSnapshot[] }) {
                                   unknown: s().health === "Unknown",
                                 }}
                               >
-                                {s().health === "Passed"
-                                  ? "健康"
-                                  : s().health === "Failed"
-                                    ? "异常"
-                                    : "未知"}
+                                {s().health === "Passed" ? "健康" : s().health === "Failed" ? "异常" : "未知"}
                               </span>
-                              <Show when={s().temperature_celsius !== null}>
-                                <span>{s().temperature_celsius}°C</span>
-                              </Show>
-                              <Show when={s().power_on_hours !== null}>
-                                <span>通电 {s().power_on_hours}h</span>
-                              </Show>
-                              <Show when={s().percentage_used !== null}>
-                                <span>寿命已用 {s().percentage_used}%</span>
-                              </Show>
-                              <Show when={(s().reallocated_sectors ?? 0) > 0}>
-                                <span class="crit">
-                                  重分配扇区 {s().reallocated_sectors}
-                                </span>
-                              </Show>
-                            </div>
-                          )}
+                            )}
+                          </Show>
+                        </span>
+                      </div>
+
+                      <div class="disk-card-summary">
+                        <Show when={disk.total_bytes > 0}>
+                          <span>{formatBytes(disk.total_bytes)}</span>
+                        </Show>
+                        <Show when={disk.smart?.temperature_celsius != null}>
+                          <span>{disk.smart!.temperature_celsius}°C</span>
+                        </Show>
+                        <Show when={disk.smart?.percentage_used != null}>
+                          <span>寿命已用 {disk.smart!.percentage_used}%</span>
+                        </Show>
+                        <Show when={disk.smart?.power_on_hours != null}>
+                          <span>通电 {disk.smart!.power_on_hours}h</span>
+                        </Show>
+                        <Show when={(disk.smart?.reallocated_sectors ?? 0) > 0}>
+                          <span class="crit">重分配扇区 {disk.smart!.reallocated_sectors}</span>
                         </Show>
                       </div>
-                    );
-                  }}
+
+                      <div class="disk-card-io">
+                        <span>读 {formatRate(disk.read_bytes_per_sec)}</span>
+                        <span>写 {formatRate(disk.write_bytes_per_sec)}</span>
+                        <Show when={!disk.per_device_io}>
+                          <span class="io-note" title="内核未提供按设备计数，此处为全机聚合值">全机</span>
+                        </Show>
+                      </div>
+
+                      <div class="disk-partitions">
+                        <For each={disk.partitions}>
+                          {(p) => {
+                            const tone = usageTone(p.usage_percent);
+                            return (
+                              <div class="part-row">
+                                <div class="part-mount">{p.mount_point}</div>
+                                <div class="bar">
+                                  <div
+                                    class="bar-fill"
+                                    classList={{ [tone]: true }}
+                                    style={{ width: `${Math.min(p.usage_percent, 100)}%` }}
+                                  />
+                                </div>
+                                <div class="part-detail">
+                                  {formatBytes(p.used_bytes)} / {formatBytes(p.total_bytes)} ({p.usage_percent.toFixed(0)}%)
+                                  <Show when={p.fs_type}>
+                                    <span class="part-fs"> {p.fs_type}</span>
+                                  </Show>
+                                </div>
+                              </div>
+                            );
+                          }}
+                        </For>
+                      </div>
+                    </div>
+                  )}
                 </For>
               </div>
 

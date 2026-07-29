@@ -62,6 +62,34 @@ export interface DiskInfo {
   smart: SmartInfo | null;
 }
 
+/** 物理盘介质类型，与后端 DiskType 枚举对应 */
+export type DiskType = "Hdd" | "Ssd" | "Nvme" | "Unknown";
+
+export interface Partition {
+  name: string;
+  mount_point: string;
+  fs_type: string;
+  total_bytes: number;
+  used_bytes: number;
+  usage_percent: number;
+}
+
+export interface PhysicalDisk {
+  /** 设备路径/标识，如 "/dev/nvme0n1"、"disk0"——悬浮时展示 */
+  device: string;
+  /** 型号，主标题；为 null 时前端回退到设备名 */
+  model: string | null;
+  disk_type: DiskType;
+  /** 整盘容量，字节；未知为 0 */
+  total_bytes: number;
+  smart: SmartInfo | null;
+  read_bytes_per_sec: number;
+  write_bytes_per_sec: number;
+  /** true=按盘真实计数；false=全机聚合 */
+  per_device_io: boolean;
+  partitions: Partition[];
+}
+
 export interface NetworkInterface {
   name: string;
   received_bytes: number;
@@ -97,6 +125,7 @@ export interface SystemMetrics {
   cpu: CpuMetrics;
   memory: MemoryMetrics;
   disks: DiskInfo[];
+  physical_disks: PhysicalDisk[];
   networks: NetworkInterface[];
   load_average: LoadAverage | null;
   top_processes: ProcessInfo[];

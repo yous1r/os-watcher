@@ -69,6 +69,11 @@ impl SmartCollector {
     pub fn snapshot(&self) -> std::collections::HashMap<String, SmartInfo> {
         self.inner.snapshot()
     }
+
+    /// 盘符→物理盘标识映射（仅 Windows 非空）。
+    pub fn partition_map(&self) -> std::collections::HashMap<String, String> {
+        self.inner.partition_map()
+    }
 }
 
 /// Expose `parse_smart_json` at crate visibility so `disk_health::mod` can

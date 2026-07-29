@@ -879,3 +879,78 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: #3d4a5e;
 }
+
+/* ---- 物理盘卡片 ---- */
+.disk-card {
+  border: 1px solid var(--border, #2a2f3a);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.disk-card.crit {
+  border-color: var(--crit, #e5484d);
+}
+.disk-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.disk-model {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.disk-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.disk-type-badge {
+  font-size: 0.75em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--badge-bg, #2a2f3a);
+}
+.disk-card-summary,
+.disk-card-io {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 0.85em;
+  color: var(--muted, #9aa4b2);
+  margin-bottom: 4px;
+}
+.disk-partitions {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border, #2a2f3a);
+}
+.part-row {
+  display: grid;
+  grid-template-columns: 80px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.part-mount {
+  font-size: 0.85em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.part-detail {
+  font-size: 0.8em;
+  color: var(--muted, #9aa4b2);
+  white-space: nowrap;
+}
+.part-fs {
+  opacity: 0.7;
+}
+.io-note {
+  font-size: 0.8em;
+  opacity: 0.7;
+}
