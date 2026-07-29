@@ -52,16 +52,21 @@ fn infer_disk_type(device: &str, smart: Option<&SmartInfo>) -> DiskType {
     }
 }
 
-/// 把挂载点归并到物理盘下。
-///
-/// `smart` 是设备标识（`/dev/sda`、`disk0`）→ `SmartInfo` 的缓存快照，作为
-/// 物理盘来源。每个挂载点用 `parent_device` 归到父盘；归不到已知盘的挂载点
-/// 落入合成的 `"unknown"` 盘，保证不丢数据。
-///
-/// 整盘容量/IO 的平台相关补全由调用方在此结果上完成（见 `enrich_linux_disks`）。
+/// 无盘符映射的便捷版本（Linux/测试）。
 pub fn assemble_physical_disks(
     inputs: &[DiskInput],
     smart: &std::collections::HashMap<String, SmartInfo>,
+) -> Vec<PhysicalDisk> {
+    let empty = std::collections::HashMap::new();
+    assemble_physical_disks_with_map(inputs, smart, &empty)
+}
+
+/// 带盘符→物理盘映射的完整版本。`partition_map` 在 Windows 上把盘符
+/// （`C:\`）对应到物理盘标识（`disk0`），其它平台传空即可。
+pub fn assemble_physical_disks_with_map(
+    inputs: &[DiskInput],
+    smart: &std::collections::HashMap<String, SmartInfo>,
+    partition_map: &std::collections::HashMap<String, String>,
 ) -> Vec<PhysicalDisk> {
     use crate::disk_health::parent_device;
 
@@ -87,7 +92,7 @@ pub fn assemble_physical_disks(
 
     // 把每个挂载点归到某块物理盘。
     for input in inputs {
-        let key = match_physical_disk(&input.name, smart, parent_device);
+        let key = match_physical_disk(&input.name, smart, partition_map, parent_device);
         let disk = disks.entry(key.clone()).or_insert_with(|| PhysicalDisk {
             device: key.clone(),
             model: None,
@@ -100,8 +105,6 @@ pub fn assemble_physical_disks(
             partitions: Vec::new(),
         });
 
-        // 整盘 IO 取该盘上各分区里的最大值：Linux 下父设备行会经 enrich 覆盖；
-        // 非 Linux 下每个分区携带的都是同一个全机聚合值，取其一即可。
         if input.read_bytes_per_sec > disk.read_bytes_per_sec {
             disk.read_bytes_per_sec = input.read_bytes_per_sec;
         }
@@ -124,7 +127,6 @@ pub fn assemble_physical_disks(
     }
 
     let mut out: Vec<PhysicalDisk> = disks.into_values().collect();
-    // 稳定排序：设备名升序，"unknown" 垫底，便于展示与测试。
     out.sort_by(|a, b| {
         let a_unknown = a.device == "unknown";
         let b_unknown = b.device == "unknown";
@@ -137,13 +139,17 @@ pub fn assemble_physical_disks(
 
 /// 决定一个挂载点归属哪块物理盘，返回物理盘的 key。
 ///
-/// 依次尝试：精确命中缓存 → 父设备命中缓存 → 前缀匹配缓存中的某个 key；
-/// 都不中则归入 `"unknown"`。
+/// 优先级：partition_map 命中 → 精确命中 smart → parent_device → 前缀匹配 → "unknown"
 fn match_physical_disk(
     partition_name: &str,
     smart: &std::collections::HashMap<String, SmartInfo>,
+    partition_map: &std::collections::HashMap<String, String>,
     parent_device: fn(&str) -> String,
 ) -> String {
+    // Windows：盘符经映射直达物理盘标识。
+    if let Some(disk) = partition_map.get(partition_name) {
+        return disk.clone();
+    }
     if smart.contains_key(partition_name) {
         return partition_name.to_string();
     }
@@ -362,7 +368,9 @@ impl MetricsCollector {
         }).collect();
 
         let smart_snapshot = smart.snapshot();
-        let mut physical_disks = assemble_physical_disks(&disk_inputs, &smart_snapshot);
+        let partition_map = smart.partition_map();
+        let mut physical_disks =
+            assemble_physical_disks_with_map(&disk_inputs, &smart_snapshot, &partition_map);
         enrich_linux_disks(&mut physical_disks, diskstats);
 
         // --- Networks ---
@@ -496,7 +504,7 @@ mod tests {
         assert!(is_physical_interface("以太网"));
     }
 
-    use crate::collector::{assemble_physical_disks, DiskInput};
+    use crate::collector::{assemble_physical_disks, assemble_physical_disks_with_map, DiskInput};
     use crate::types::{DiskType, SmartHealth, SmartInfo};
     use std::collections::HashMap;
 
@@ -595,5 +603,26 @@ mod tests {
         assert_eq!(super::device_basename("/dev/nvme0n1"), "nvme0n1");
         assert_eq!(super::device_basename("/dev/sda"), "sda");
         assert_eq!(super::device_basename("disk0"), "disk0");
+    }
+
+    #[test]
+    fn windows_drive_letters_map_to_physical_disk() {
+        let mut smart = HashMap::new();
+        smart.insert("disk0".to_string(), smart_stub("disk0", Some(0)));
+
+        let mut pmap = HashMap::new();
+        pmap.insert("C:\\".to_string(), "disk0".to_string());
+        pmap.insert("D:\\".to_string(), "disk0".to_string());
+
+        let inputs = vec![
+            disk_input("C:\\", "C:\\", 500, 200),
+            disk_input("D:\\", "D:\\", 500, 100),
+        ];
+
+        let disks = assemble_physical_disks_with_map(&inputs, &smart, &pmap);
+
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].device, "disk0");
+        assert_eq!(disks[0].partitions.len(), 2);
     }
 }

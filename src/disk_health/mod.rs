@@ -107,6 +107,18 @@ impl DiskHealthCollector {
         self.cache.clone()
     }
 
+    /// 盘符→物理盘标识映射。仅 Windows 有意义，其它平台返回空。
+    pub fn partition_map(&self) -> std::collections::HashMap<String, String> {
+        #[cfg(target_os = "windows")]
+        {
+            windows::query_partition_map()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::collections::HashMap::new()
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn refresh_linux(&mut self) {
         use linux::hwmon_temperatures;
