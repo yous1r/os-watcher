@@ -26,6 +26,184 @@ pub struct MetricsCollector {
     last_sample: Option<Instant>,
 }
 
+/// 组装物理盘视图的中间输入：一个挂载点/分区的原始信息。
+/// 由 `collect()` 从 sysinfo 的 `Disks` 逐项填充，与采集逻辑解耦以便测试。
+pub struct DiskInput {
+    pub name: String,
+    pub mount_point: String,
+    pub fs_type: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub read_bytes_per_sec: f64,
+    pub write_bytes_per_sec: f64,
+    pub per_device_io: bool,
+}
+
+/// 根据 SMART 的 rotation_rate 与设备名推断盘类型。
+fn infer_disk_type(device: &str, smart: Option<&SmartInfo>) -> DiskType {
+    let base = device.rsplit('/').next().unwrap_or(device);
+    if base.starts_with("nvme") {
+        return DiskType::Nvme;
+    }
+    match smart.and_then(|s| s.rotation_rate) {
+        Some(0) => DiskType::Ssd,
+        Some(_) => DiskType::Hdd,
+        None => DiskType::Unknown,
+    }
+}
+
+/// 把挂载点归并到物理盘下。
+///
+/// `smart` 是设备标识（`/dev/sda`、`disk0`）→ `SmartInfo` 的缓存快照，作为
+/// 物理盘来源。每个挂载点用 `parent_device` 归到父盘；归不到已知盘的挂载点
+/// 落入合成的 `"unknown"` 盘，保证不丢数据。
+///
+/// 整盘容量/IO 的平台相关补全由调用方在此结果上完成（见 `enrich_linux_disks`）。
+pub fn assemble_physical_disks(
+    inputs: &[DiskInput],
+    smart: &std::collections::HashMap<String, SmartInfo>,
+) -> Vec<PhysicalDisk> {
+    use crate::disk_health::parent_device;
+
+    // 先为每个已知物理盘建一个空壳，key 为设备标识。
+    let mut disks: std::collections::HashMap<String, PhysicalDisk> =
+        std::collections::HashMap::new();
+    for (device, info) in smart {
+        disks.insert(
+            device.clone(),
+            PhysicalDisk {
+                device: device.clone(),
+                model: info.model.clone(),
+                disk_type: infer_disk_type(device, Some(info)),
+                total_bytes: 0,
+                smart: Some(info.clone()),
+                read_bytes_per_sec: 0.0,
+                write_bytes_per_sec: 0.0,
+                per_device_io: false,
+                partitions: Vec::new(),
+            },
+        );
+    }
+
+    // 把每个挂载点归到某块物理盘。
+    for input in inputs {
+        let key = match_physical_disk(&input.name, smart, parent_device);
+        let disk = disks.entry(key.clone()).or_insert_with(|| PhysicalDisk {
+            device: key.clone(),
+            model: None,
+            disk_type: DiskType::Unknown,
+            total_bytes: 0,
+            smart: None,
+            read_bytes_per_sec: 0.0,
+            write_bytes_per_sec: 0.0,
+            per_device_io: false,
+            partitions: Vec::new(),
+        });
+
+        // 整盘 IO 取该盘上各分区里的最大值：Linux 下父设备行会经 enrich 覆盖；
+        // 非 Linux 下每个分区携带的都是同一个全机聚合值，取其一即可。
+        if input.read_bytes_per_sec > disk.read_bytes_per_sec {
+            disk.read_bytes_per_sec = input.read_bytes_per_sec;
+        }
+        if input.write_bytes_per_sec > disk.write_bytes_per_sec {
+            disk.write_bytes_per_sec = input.write_bytes_per_sec;
+        }
+
+        disk.partitions.push(Partition {
+            name: input.name.clone(),
+            mount_point: input.mount_point.clone(),
+            fs_type: input.fs_type.clone(),
+            total_bytes: input.total_bytes,
+            used_bytes: input.used_bytes,
+            usage_percent: if input.total_bytes > 0 {
+                (input.used_bytes as f32 / input.total_bytes as f32) * 100.0
+            } else {
+                0.0
+            },
+        });
+    }
+
+    let mut out: Vec<PhysicalDisk> = disks.into_values().collect();
+    // 稳定排序：设备名升序，"unknown" 垫底，便于展示与测试。
+    out.sort_by(|a, b| {
+        let a_unknown = a.device == "unknown";
+        let b_unknown = b.device == "unknown";
+        a_unknown
+            .cmp(&b_unknown)
+            .then_with(|| a.device.cmp(&b.device))
+    });
+    out
+}
+
+/// 决定一个挂载点归属哪块物理盘，返回物理盘的 key。
+///
+/// 依次尝试：精确命中缓存 → 父设备命中缓存 → 前缀匹配缓存中的某个 key；
+/// 都不中则归入 `"unknown"`。
+fn match_physical_disk(
+    partition_name: &str,
+    smart: &std::collections::HashMap<String, SmartInfo>,
+    parent_device: fn(&str) -> String,
+) -> String {
+    if smart.contains_key(partition_name) {
+        return partition_name.to_string();
+    }
+    let parent = parent_device(partition_name);
+    if smart.contains_key(&parent) {
+        return parent;
+    }
+    // 前缀匹配：分区名以某个物理盘 key 开头（如 "/dev/nvme0n1p1" 命中 "/dev/nvme0n1"）。
+    if let Some(k) = smart
+        .keys()
+        .find(|k| partition_name.starts_with(k.as_str()))
+    {
+        return k.clone();
+    }
+    "unknown".to_string()
+}
+
+/// /sys/block/<dev>/size 的扇区数换算为字节（512 字节/扇区）。
+fn sectors_to_bytes(sectors: u64) -> u64 {
+    sectors.saturating_mul(512)
+}
+
+/// 去掉设备路径的 `/dev/` 前缀，得到 sysfs/diskstats 用的基础名。
+/// `/dev/nvme0n1` → `nvme0n1`；无前缀时原样返回。
+fn device_basename(device: &str) -> &str {
+    device.rsplit('/').next().unwrap_or(device)
+}
+
+/// Linux 下用 sysfs 补整盘容量、用 diskstats 补按盘 I/O。
+///
+/// `diskstats` 的父设备行本身就是整盘计数，按设备基础名查即可。
+#[cfg(target_os = "linux")]
+fn enrich_linux_disks(disks: &mut [PhysicalDisk], diskstats: &crate::diskstats::DiskStats) {
+    for disk in disks.iter_mut() {
+        if disk.device == "unknown" {
+            continue;
+        }
+        let base = device_basename(&disk.device);
+
+        // 整盘容量：/sys/block/<base>/size
+        let size_path = format!("/sys/block/{}/size", base);
+        if let Ok(s) = std::fs::read_to_string(&size_path) {
+            if let Ok(sectors) = s.trim().parse::<u64>() {
+                disk.total_bytes = sectors_to_bytes(sectors);
+            }
+        }
+
+        // 整盘 I/O：diskstats 的父设备行。
+        if let Some(delta) = diskstats.lookup(base) {
+            disk.read_bytes_per_sec = delta.read_bytes_per_sec;
+            disk.write_bytes_per_sec = delta.write_bytes_per_sec;
+            disk.per_device_io = true;
+        }
+    }
+}
+
+/// 非 Linux：无 sysfs/diskstats，容量与 I/O 维持 assemble 阶段的值。
+#[cfg(not(target_os = "linux"))]
+fn enrich_linux_disks(_disks: &mut [PhysicalDisk], _diskstats: &crate::diskstats::DiskStats) {}
+
 impl MetricsCollector {
     pub fn new() -> Self {
         let mut sys = System::new_all();
@@ -163,6 +341,30 @@ impl MetricsCollector {
             }
         }).collect();
 
+        // 物理盘视图的原始输入：与上面的 DiskInfo 用同一批挂载点，但保留设备名
+        // 以便按父设备归并。
+        let disk_inputs: Vec<DiskInput> = self.disks.iter().map(|d| {
+            let name = d.name().to_string_lossy().to_string();
+            let total = d.total_space();
+            let available = d.available_space();
+            let used = total.saturating_sub(available);
+            let io = diskstats.lookup(&name);
+            DiskInput {
+                read_bytes_per_sec: io.map_or(host_read_per_sec, |x| x.read_bytes_per_sec),
+                write_bytes_per_sec: io.map_or(host_write_per_sec, |x| x.write_bytes_per_sec),
+                per_device_io: io.is_some(),
+                name,
+                mount_point: d.mount_point().to_string_lossy().to_string(),
+                fs_type: d.file_system().to_string_lossy().to_string(),
+                total_bytes: total,
+                used_bytes: used,
+            }
+        }).collect();
+
+        let smart_snapshot = smart.snapshot();
+        let mut physical_disks = assemble_physical_disks(&disk_inputs, &smart_snapshot);
+        enrich_linux_disks(&mut physical_disks, diskstats);
+
         // --- Networks ---
         use crate::disk_health::filter::is_physical_interface;
         let networks: Vec<NetworkInterface> = self.networks.iter()
@@ -245,6 +447,7 @@ impl MetricsCollector {
             cpu,
             memory,
             disks,
+            physical_disks,
             networks,
             load_average,
             top_processes: processes,
@@ -291,5 +494,106 @@ mod tests {
         assert!(is_physical_interface("wlan0"));
         assert!(is_physical_interface("Wi-Fi"));
         assert!(is_physical_interface("以太网"));
+    }
+
+    use crate::collector::{assemble_physical_disks, DiskInput};
+    use crate::types::{DiskType, SmartHealth, SmartInfo};
+    use std::collections::HashMap;
+
+    fn smart_stub(device: &str, rotation: Option<u32>) -> SmartInfo {
+        SmartInfo {
+            device: device.to_string(),
+            model: Some("Test Model".to_string()),
+            serial: None,
+            firmware: None,
+            rotation_rate: rotation,
+            health: SmartHealth::Passed,
+            temperature_celsius: Some(40),
+            power_on_hours: None,
+            power_cycle_count: None,
+            reallocated_sectors: None,
+            percentage_used: None,
+            data_units_written_bytes: None,
+            attributes: vec![],
+            collected_at: chrono::Utc::now(),
+        }
+    }
+
+    fn disk_input(name: &str, mount: &str, total: u64, used: u64) -> DiskInput {
+        DiskInput {
+            name: name.to_string(),
+            mount_point: mount.to_string(),
+            fs_type: "ext4".to_string(),
+            total_bytes: total,
+            used_bytes: used,
+            read_bytes_per_sec: 0.0,
+            write_bytes_per_sec: 0.0,
+            per_device_io: false,
+        }
+    }
+
+    #[test]
+    fn partitions_group_under_parent_device() {
+        let mut smart = HashMap::new();
+        smart.insert("/dev/nvme0n1".to_string(), smart_stub("/dev/nvme0n1", Some(0)));
+
+        let inputs = vec![
+            disk_input("/dev/nvme0n1p1", "/boot", 500_000, 100_000),
+            disk_input("/dev/nvme0n1p2", "/", 1_000_000, 400_000),
+        ];
+
+        let disks = assemble_physical_disks(&inputs, &smart);
+
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].device, "/dev/nvme0n1");
+        assert_eq!(disks[0].partitions.len(), 2);
+        assert_eq!(disks[0].disk_type, DiskType::Nvme);
+    }
+
+    #[test]
+    fn unmatched_partition_falls_into_unknown_disk() {
+        // SMART 缓存为空（如 smartctl 未安装）——所有分区归入合成的"未知盘"。
+        let smart: HashMap<String, SmartInfo> = HashMap::new();
+        let inputs = vec![disk_input("//server/share", "/mnt/net", 0, 0)];
+
+        let disks = assemble_physical_disks(&inputs, &smart);
+
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].device, "unknown");
+        assert!(disks[0].model.is_none());
+        assert_eq!(disks[0].partitions.len(), 1);
+    }
+
+    #[test]
+    fn disk_type_inferred_from_rotation_rate() {
+        let mut smart = HashMap::new();
+        smart.insert("/dev/sda".to_string(), smart_stub("/dev/sda", Some(7200)));
+        smart.insert("/dev/sdb".to_string(), smart_stub("/dev/sdb", Some(0)));
+
+        let inputs = vec![
+            disk_input("/dev/sda1", "/data", 100, 10),
+            disk_input("/dev/sdb1", "/backup", 100, 10),
+        ];
+
+        let disks = assemble_physical_disks(&inputs, &smart);
+
+        let sda = disks.iter().find(|d| d.device == "/dev/sda").unwrap();
+        let sdb = disks.iter().find(|d| d.device == "/dev/sdb").unwrap();
+        assert_eq!(sda.disk_type, DiskType::Hdd);
+        assert_eq!(sdb.disk_type, DiskType::Ssd);
+    }
+
+    #[test]
+    fn sysfs_size_converts_sectors_to_bytes() {
+        // /sys/block/<dev>/size 以 512 字节扇区计数。
+        assert_eq!(super::sectors_to_bytes(2_048), 2_048 * 512);
+        assert_eq!(super::sectors_to_bytes(0), 0);
+    }
+
+    #[test]
+    fn device_basename_strips_dev_prefix() {
+        assert_eq!(super::device_basename("/dev/nvme0n1"), "nvme0n1");
+        assert_eq!(super::device_basename("/dev/sda"), "sda");
+        assert_eq!(super::device_basename("disk0"), "disk0");
     }
 }
