@@ -20,6 +20,52 @@ struct GossipEnvelope {
     msg_id: uuid::Uuid,
 }
 
+/// Broadcast a NodeLeave message on a best-effort basis so peers mark this
+/// node offline immediately rather than waiting for the stale timeout.
+/// Called once from main() just before the process exits.
+pub async fn broadcast_leave(state: &SharedState, config: &NetworkConfig) {
+    let (node_id, peer_addrs) = {
+        let s = state.read().await;
+        (s.local_node.id, s.peer_gossip_addrs())
+    };
+
+    let bind_addr = format!("{}:0", config.bind_addr);
+    let socket = match UdpSocket::bind(&bind_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("broadcast_leave: failed to bind UDP socket: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = socket.set_broadcast(true) {
+        warn!("broadcast_leave: set_broadcast failed: {}", e);
+    }
+
+    let envelope = GossipEnvelope {
+        message: GossipMessage::NodeLeave(node_id),
+        hops: 0,
+        max_hops: config.max_hops,
+        msg_id: uuid::Uuid::new_v4(),
+    };
+    let data = match serde_json::to_vec(&envelope) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    // Send to all known peers
+    for addr in &peer_addrs {
+        let _ = socket.send_to(&data, addr).await;
+    }
+
+    // Also broadcast on LAN so nodes we haven't synced yet get notified
+    if config.enable_discovery {
+        let broadcast_addr = format!("255.255.255.255:{}", config.gossip_port);
+        let _ = socket.send_to(&data, &broadcast_addr).await;
+    }
+
+    info!("NodeLeave broadcast sent ({} known peers)", peer_addrs.len());
+}
+
 /// Namespace for gossip service associated functions.
 pub struct GossipService;
 

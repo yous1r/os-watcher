@@ -34,8 +34,25 @@ impl NodeState {
         }
     }
 
-    /// Update or insert a peer's info
+    /// Update or insert a peer's info.
+    ///
+    /// If a peer with the same `gossip_addr` but a *different* ID already
+    /// exists (e.g. the remote node restarted and got a new UUID), the stale
+    /// entry is removed first so the web UI never shows duplicate nodes.
     pub fn upsert_peer(&mut self, info: NodeInfo) {
+        // Collect stale IDs: same gossip address, different UUID.
+        let stale_ids: Vec<NodeId> = self
+            .peers
+            .iter()
+            .filter(|(&id, p)| id != info.id && p.gossip_addr == info.gossip_addr)
+            .map(|(&id, _)| id)
+            .collect();
+
+        for id in stale_ids {
+            self.peers.remove(&id);
+            self.metrics.remove(&id);
+        }
+
         self.peers.insert(info.id, info);
     }
 
