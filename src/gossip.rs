@@ -8,6 +8,7 @@ use anyhow::Result;
 
 use crate::config::NetworkConfig;
 use crate::state::SharedState;
+use crate::storage::Database;
 use crate::types::*;
 
 /// Message envelope with hop count for TTL-based flood prevention
@@ -74,6 +75,7 @@ impl GossipService {
     pub async fn run_with_rx(
         state: SharedState,
         config: NetworkConfig,
+        db: Arc<Database>,
     ) -> Result<()> {
         let bind_addr = format!("{}:{}", config.bind_addr, config.gossip_port);
         let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
@@ -111,6 +113,7 @@ impl GossipService {
         let recv_socket = Arc::clone(&socket);
         let recv_state = Arc::clone(&state);
         let recv_tx = tx.clone();
+        let recv_db = Arc::clone(&db);
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
@@ -118,7 +121,7 @@ impl GossipService {
                 match recv_socket.recv_from(&mut buf).await {
                     Ok((len, src)) => {
                         if let Ok(envelope) = serde_json::from_slice::<GossipEnvelope>(&buf[..len]) {
-                            Self::handle_message(&recv_state, envelope, src, &recv_tx, max_hops).await;
+                            Self::handle_message(&recv_state, envelope, src, &recv_tx, max_hops, Arc::clone(&recv_db)).await;
                         }
                     }
                     Err(e) => {
@@ -254,6 +257,7 @@ impl GossipService {
         src: SocketAddr,
         tx: &mpsc::Sender<(GossipEnvelope, Option<String>)>,
         max_hops: u8,
+        db: Arc<Database>,
     ) {
         match envelope.message {
             GossipMessage::NodeAnnounce(mut info) => {
@@ -323,6 +327,17 @@ impl GossipService {
                         peer.status = NodeStatus::Online;
                     }
                     s.update_metrics(node_id, *metrics.clone());
+                }
+
+                // 持久化远程节点指标（后台任务，不阻塞接收循环）
+                {
+                    let db_clone = Arc::clone(&db);
+                    let metrics_clone = *metrics.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = db_clone.store_metrics(&node_id, &metrics_clone).await {
+                            tracing::warn!("Failed to persist remote metrics for {}: {}", node_id, e);
+                        }
+                    });
                 }
 
                 // Forward if hops remain
