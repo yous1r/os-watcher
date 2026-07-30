@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Root configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +23,9 @@ pub struct Config {
     /// TUI settings
     #[serde(default)]
     pub tui: TuiConfig,
+    /// Self-upgrade settings
+    #[serde(default)]
+    pub upgrade: UpgradeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +126,60 @@ pub struct TuiConfig {
     pub refresh_ms: u64,
 }
 
+/// Release package flavour used for deploy and self-upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackageKind {
+    /// Node-only package without bundled web assets
+    Node,
+    /// Full package with bundled web dashboard
+    Full,
+}
+
+impl PackageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl Default for PackageKind {
+    fn default() -> Self {
+        Self::Node
+    }
+}
+
+impl fmt::Display for PackageKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Self-upgrade configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpgradeConfig {
+    /// Enable version polling and upgrade API.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// GitHub repository in owner/name form.
+    #[serde(default = "default_upgrade_github_repo")]
+    pub github_repo: String,
+    /// How often to poll GitHub Releases for the latest tag.
+    #[serde(default = "default_upgrade_check_interval")]
+    pub check_interval_secs: u64,
+    /// Default package flavour when an upgrade request omits package.
+    #[serde(default)]
+    pub package: PackageKind,
+    /// Service name used by systemd/sc.exe restart commands.
+    #[serde(default = "default_upgrade_service_name")]
+    pub service_name: String,
+    /// Optional proxy URL; HTTP(S)_PROXY environment variables still work.
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
 /// An alert rule definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertRule {
@@ -145,22 +203,63 @@ pub struct AlertRule {
 }
 
 // Default value functions
-fn default_node_role() -> String { "both".to_string() }
-fn default_collect_interval() -> u64 { 5 }
-fn default_top_processes() -> usize { 10 }
-fn default_true() -> bool { true }
-fn default_gossip_port() -> u16 { 7979 }
-fn default_announce_interval() -> u64 { 30 }
-fn default_gossip_interval() -> u64 { 10 }
-fn default_max_hops() -> u8 { 3 }
-fn default_bind_addr() -> String { "0.0.0.0".to_string() }
-fn default_api_port() -> u16 { 7980 }
-fn default_web_dir() -> String { "web/dist".to_string() }
-fn default_db_path() -> String { "os-watcher.db".to_string() }
-fn default_retention_hours() -> u64 { 168 } // 7 days
-fn default_tui_refresh_ms() -> u64 { 1000 }
-fn default_consecutive_violations() -> u32 { 1 }
-fn default_severity() -> String { "warning".to_string() }
+fn default_node_role() -> String {
+    "both".to_string()
+}
+fn default_collect_interval() -> u64 {
+    5
+}
+fn default_top_processes() -> usize {
+    10
+}
+fn default_true() -> bool {
+    true
+}
+fn default_gossip_port() -> u16 {
+    7979
+}
+fn default_announce_interval() -> u64 {
+    30
+}
+fn default_gossip_interval() -> u64 {
+    10
+}
+fn default_max_hops() -> u8 {
+    3
+}
+fn default_bind_addr() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_api_port() -> u16 {
+    7980
+}
+fn default_web_dir() -> String {
+    "web/dist".to_string()
+}
+fn default_db_path() -> String {
+    "os-watcher.db".to_string()
+}
+fn default_retention_hours() -> u64 {
+    168
+} // 7 days
+fn default_tui_refresh_ms() -> u64 {
+    1000
+}
+fn default_consecutive_violations() -> u32 {
+    1
+}
+fn default_severity() -> String {
+    "warning".to_string()
+}
+fn default_upgrade_github_repo() -> String {
+    "yous1r/os-watcher".to_string()
+}
+fn default_upgrade_check_interval() -> u64 {
+    1800
+}
+fn default_upgrade_service_name() -> String {
+    "os-watcher".to_string()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -214,12 +313,15 @@ impl Default for Config {
                     threshold: 90.0,
                     consecutive_violations: 2,
                     severity: "warning".to_string(),
-                    message: Some("Memory usage is {value:.1}% (threshold: {threshold}%)".to_string()),
+                    message: Some(
+                        "Memory usage is {value:.1}% (threshold: {threshold}%)".to_string(),
+                    ),
                 },
             ],
             tui: TuiConfig {
                 refresh_ms: default_tui_refresh_ms(),
             },
+            upgrade: UpgradeConfig::default(),
         }
     }
 }
@@ -237,6 +339,19 @@ impl Default for WebConfig {
         Self {
             enabled: false,
             dir: default_web_dir(),
+        }
+    }
+}
+
+impl Default for UpgradeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            github_repo: default_upgrade_github_repo(),
+            check_interval_secs: default_upgrade_check_interval(),
+            package: PackageKind::Node,
+            service_name: default_upgrade_service_name(),
+            proxy: None,
         }
     }
 }
@@ -317,5 +432,29 @@ mod tests {
         )
         .expect("legacy config without [web] should parse");
         assert!(!cfg.web.enabled);
+    }
+
+    #[test]
+    fn upgrade_defaults_are_loaded_when_section_absent() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [node]
+            [metrics]
+            [network]
+            [api]
+            [storage]
+            "#,
+        )
+        .expect("legacy config without [upgrade] should parse");
+
+        assert!(cfg.upgrade.enabled);
+        assert_eq!(cfg.upgrade.github_repo, "yous1r/os-watcher");
+        assert_eq!(cfg.upgrade.package, PackageKind::Node);
+    }
+
+    #[test]
+    fn full_template_defaults_upgrade_package_to_full() {
+        let cfg = parse(FULL_CONFIG_TEMPLATE);
+        assert_eq!(cfg.upgrade.package, PackageKind::Full);
     }
 }

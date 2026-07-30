@@ -1,7 +1,7 @@
 import { createSignal, createResource, onCleanup, Show } from "solid-js";
 import { Tabs } from "@ark-ui/solid/tabs";
-import { fetchSnapshots, fetchAlerts, API_BASE } from "./api";
-import type { NodeSnapshot, Alert } from "./types";
+import { fetchSnapshots, fetchAlerts, fetchVersion, API_BASE } from "./api";
+import type { NodeSnapshot, Alert, VersionInfo } from "./types";
 import { formatTime } from "./format";
 import { Overview } from "./views/Overview";
 import { NodeDetail } from "./views/NodeDetail";
@@ -42,6 +42,21 @@ export default function App() {
       }
     },
     { initialValue: [] }
+  );
+
+  const [versionInfo, { refetch: refetchVersion }] = createResource<
+    VersionInfo | null,
+    number
+  >(
+    tick,
+    async () => {
+      try {
+        return await fetchVersion();
+      } catch {
+        return null;
+      }
+    },
+    { initialValue: null }
   );
 
   const timer = setInterval(() => setTick((t) => t + 1), REFRESH_MS);
@@ -103,7 +118,11 @@ export default function App() {
         </Tabs.List>
 
         <Tabs.Content value="overview" class="tab-content">
-          <Overview snapshots={snapshots()} />
+          <Overview
+            snapshots={snapshots()}
+            versionInfo={versionInfo()}
+            onUpgradeRequested={refetchVersion}
+          />
         </Tabs.Content>
         <Tabs.Content value="detail" class="tab-content">
           <NodeDetail snapshots={snapshots()} />

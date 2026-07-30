@@ -151,6 +151,44 @@ export interface NodeSnapshot {
   metrics: SystemMetrics | null;
 }
 
+export type PackageKind = "node" | "full";
+
+export type UpgradePhase =
+  | "idle"
+  | "checking"
+  | "downloading"
+  | "backing_up"
+  | "installing"
+  | "restarting"
+  | "succeeded"
+  | "failed"
+  | "rolled_back";
+
+export interface UpgradeStatus {
+  running: boolean;
+  phase: UpgradePhase;
+  message: string;
+  package: PackageKind | null;
+  target_version: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface VersionInfo {
+  current: string;
+  latest: string | null;
+  update_available: boolean;
+  checked_at: string | null;
+  platform: string;
+  package: PackageKind;
+  upgrade: UpgradeStatus;
+}
+
+export interface UpgradeRequest {
+  package?: PackageKind;
+  proxy?: string;
+}
+
 export type AlertSeverity = "Info" | "Warning" | "Critical";
 
 export interface Alert {
@@ -168,4 +206,5 @@ export interface Alert {
 export interface ApiResponse<T> {
   success: boolean;
   data: T;
+  error?: string;
 }
