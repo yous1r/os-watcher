@@ -36,7 +36,7 @@ dir = "web-dist"                # 发布包内前端静态资源目录
 
 [storage]
 db_path = "os-watcher.db"       # SQLite 数据库文件路径
-retention_hours = 720           # 面板节点保留 30 天历史，供趋势图查询
+retention_hours = 12             # 仅 web 节点存库，保留 12 小时历史记录
 
 [tui]
 refresh_ms = 1000               # 终端面板刷新间隔（毫秒）
