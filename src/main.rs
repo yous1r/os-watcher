@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::collector::MetricsCollector;
 use crate::config::{generate_default_config, load_config, Config, ConfigProfile, PackageKind};
-use crate::gossip::GossipService;
+use crate::gossip::{GossipService, broadcast_leave};
 use crate::state::new_shared_state;
 use crate::types::{NodeInfo, NodeStatus};
 use crate::upgrade::{UpgradeHelperRequest, UpgradeManager};
@@ -345,7 +345,7 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
 
     // Run TUI or just wait
     if use_tui {
-        tui::run_tui(state, tui_refresh_ms).await?;
+        tui::run_tui(Arc::clone(&state), tui_refresh_ms).await?;
     } else {
         info!("os-watcher running. Press Ctrl+C to stop.");
         info!("Use '--tui' flag to start the terminal dashboard.");
@@ -353,6 +353,10 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
         tokio::signal::ctrl_c().await?;
         info!("Shutting down...");
     }
+
+    // Notify peers that this node is leaving so they mark it offline
+    // immediately instead of waiting for the stale-peer timeout.
+    broadcast_leave(&state, &cfg.network).await;
 
     Ok(())
 }
