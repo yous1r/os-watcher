@@ -3,4 +3,5 @@ target
 
 *.db
 .worktrees/
-.settings*.json
+settings.json
+settings*.json
