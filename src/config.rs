@@ -240,8 +240,8 @@ fn default_db_path() -> String {
     "os-watcher.db".to_string()
 }
 fn default_retention_hours() -> u64 {
-    168
-} // 7 days
+    12
+} // 12 hours
 fn default_tui_refresh_ms() -> u64 {
     1000
 }
