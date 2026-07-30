@@ -15,8 +15,8 @@ pub struct NodeState {
     pub metrics: HashMap<NodeId, SystemMetrics>,
     /// Active alerts
     pub alerts: Vec<Alert>,
-    /// Violation counters for alert rules (rule_name -> consecutive count)
-    pub violation_counts: HashMap<String, u32>,
+    /// Violation counters for alert rules, keyed by (node_id, rule_name)
+    pub violation_counts: HashMap<NodeId, HashMap<String, u32>>,
 }
 
 impl NodeState {
