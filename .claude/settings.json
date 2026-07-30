@@ -1,0 +1,26 @@
+{
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+  "autoUpdatesChannel": "stable",
+  "effortLevel": "xhigh",
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "sk-h7awQHwGUTFiLQ9bm0p3IPE0gPhfkkRb2u0OIUkPXoEsplMW",
+    "ANTHROPIC_BASE_URL": "https://uf.721721.xyz",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-sonnet-4-5-20250929-thinking",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME": "claude-sonnet-4-5-20250929-thinking",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-sonnet-4-5-20250929",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "claude-sonnet-4-5-20250929",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-sonnet-4-5-20250929-thinking",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "claude-sonnet-4-5-20250929-thinking",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-5-20250929-thinking",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "claude-sonnet-4-5-20250929-thinking",
+    "ANTHROPIC_MODEL": "claude-sonnet-4-5-20250929-thinking",
+    "CLAUDE_CODE_EFFORT_LEVEL": "max",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "claude-sonnet-4-5-20250929-thinking",
+    "DISABLE_AUTOUPDATER": "1",
+    "ENABLE_TOOL_SEARCH": "true"
+  },
+  "model": "fable"
+}

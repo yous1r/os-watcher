@@ -38,6 +38,14 @@ retention_hours = 72            # 本地只留 3 天，长期历史由面板节�
 [tui]
 refresh_ms = 1000               # 终端面板刷新间隔（毫秒），启动时加 --tui 使用
 
+[upgrade]
+enabled = true                  # 开启版本检测与 /api/v1/upgrade 自升级接口
+github_repo = "yous1r/os-watcher" # GitHub Release 仓库（owner/repo）
+check_interval_secs = 1800      # 后台检测最新版本的间隔（秒）
+package = "node"                # 默认升级普通节点包
+service_name = "os-watcher"     # Linux systemd / Windows 服务名
+# proxy = "http://127.0.0.1:7890" # 可选；也支持 HTTP_PROXY/HTTPS_PROXY 环境变量
+
 # ---- 告警规则 ----
 [[alerts]]
 name = "high_cpu"

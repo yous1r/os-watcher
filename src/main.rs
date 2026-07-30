@@ -1,29 +1,31 @@
-mod types;
-mod config;
-mod collector;
-mod diskstats;
-mod disk_health;
-mod state;
-mod gossip;
-mod api;
 mod alerts;
-mod tui;
-mod storage;
+mod api;
+mod collector;
+mod config;
+mod disk_health;
+mod diskstats;
+mod gossip;
 mod smart;
+mod state;
+mod storage;
+mod tui;
+mod types;
+mod upgrade;
 
-use std::sync::Arc;
+use anyhow::Result;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use tracing::{info, error};
+use std::{path::PathBuf, sync::Arc};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-use anyhow::Result;
 
-use crate::config::{Config, ConfigProfile, load_config, generate_default_config};
 use crate::collector::MetricsCollector;
+use crate::config::{generate_default_config, load_config, Config, ConfigProfile, PackageKind};
 use crate::gossip::GossipService;
 use crate::state::new_shared_state;
 use crate::types::{NodeInfo, NodeStatus};
+use crate::upgrade::{UpgradeHelperRequest, UpgradeManager};
 
 #[derive(Parser)]
 #[command(
@@ -81,6 +83,24 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:7980")]
         api: String,
     },
+    /// Internal helper used by self-upgrade restart orchestration.
+    #[command(hide = true)]
+    UpgradeHelper {
+        #[arg(long)]
+        service_name: String,
+        #[arg(long)]
+        current_exe: PathBuf,
+        #[arg(long)]
+        install_dir: PathBuf,
+        #[arg(long)]
+        backup_dir: PathBuf,
+        #[arg(long)]
+        status_file: PathBuf,
+        #[arg(long)]
+        target_version: String,
+        #[arg(long)]
+        package: String,
+    },
 }
 
 #[tokio::main]
@@ -90,8 +110,7 @@ async fn main() -> Result<()> {
     // Init logging
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&cli.log_level))
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level)),
         )
         .with_target(false)
         .compact()
@@ -113,7 +132,36 @@ async fn main() -> Result<()> {
             run_status_check(&api).await?;
         }
 
-        Commands::Start { gossip_port, api_port, peers, tui: use_tui, web, web_dir } => {
+        Commands::UpgradeHelper {
+            service_name,
+            current_exe,
+            install_dir,
+            backup_dir,
+            status_file,
+            target_version,
+            package,
+        } => {
+            let package = parse_package_kind(&package)?;
+            upgrade::run_upgrade_helper(UpgradeHelperRequest {
+                service_name,
+                current_exe,
+                install_dir,
+                backup_dir,
+                status_file,
+                target_version,
+                package,
+            })
+            .await?;
+        }
+
+        Commands::Start {
+            gossip_port,
+            api_port,
+            peers,
+            tui: use_tui,
+            web,
+            web_dir,
+        } => {
             // Load or default config
             let mut cfg = match load_config(&cli.config) {
                 Ok(c) => {
@@ -134,7 +182,8 @@ async fn main() -> Result<()> {
                 cfg.api.port = p;
             }
             if let Some(peers_str) = peers {
-                let extra: Vec<String> = peers_str.split(',')
+                let extra: Vec<String> = peers_str
+                    .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
@@ -160,6 +209,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn parse_package_kind(value: &str) -> Result<PackageKind> {
+    match value {
+        "node" => Ok(PackageKind::Node),
+        "full" => Ok(PackageKind::Full),
+        _ => Err(anyhow::anyhow!("invalid package kind: {value}")),
+    }
+}
+
 async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Result<()> {
     let hostname = sysinfo::System::host_name().unwrap_or_else(|| "unknown".to_string());
     let node_name = cfg.node.name.clone().unwrap_or_else(|| hostname.clone());
@@ -170,10 +227,10 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
     // prefer the explicit advertise_addr, then auto-detect the outbound IP.
     let advertise_host = resolve_advertise_addr(&cfg.network);
 
-    let api_addr = format!("{}:{}", cfg.api.bind_addr, cfg.api.port);
+    let api_addr = resolve_api_addr(&cfg.api, &advertise_host);
     // The gossip_addr we announce must be reachable by remote nodes, so use
     // the resolved advertise address, not the wildcard bind address.
-    let gossip_addr = format!("{}:{}", advertise_host, cfg.network.gossip_port);
+    let gossip_addr = format_host_port(&advertise_host, cfg.network.gossip_port);
 
     let local_node = NodeInfo {
         id: node_id,
@@ -188,7 +245,10 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
     info!("Starting os-watcher node: {} ({})", node_name, node_id);
     info!("  API: http://{}", api_addr);
     info!("  Gossip (advertised): udp://{}", gossip_addr);
-    info!("  Gossip bind: udp://{}:{}", cfg.network.bind_addr, cfg.network.gossip_port);
+    info!(
+        "  Gossip bind: udp://{}:{}",
+        cfg.network.bind_addr, cfg.network.gossip_port
+    );
     info!("  Peers configured: {}", cfg.network.peers.len());
 
     // Initialize shared state
@@ -196,9 +256,14 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
 
     // Initialize database
     let db = Arc::new(
-        storage::Database::new(&cfg.storage.db_path).await
-            .expect("Failed to initialize database")
+        storage::Database::new(&cfg.storage.db_path)
+            .await
+            .expect("Failed to initialize database"),
     );
+
+    // Start release-version polling before serving API requests.
+    let upgrade_manager = UpgradeManager::new(cfg.upgrade.clone(), env!("CARGO_PKG_VERSION"))?;
+    upgrade_manager.spawn_version_check_loop();
 
     // Clone for tasks
     let cfg = Arc::new(cfg);
@@ -213,9 +278,8 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
     let collect_db = Arc::clone(&db);
     tokio::spawn(async move {
         let mut collector = MetricsCollector::new();
-        let mut interval = tokio::time::interval(
-            tokio::time::Duration::from_secs(collect_interval)
-        );
+        let mut interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(collect_interval));
 
         loop {
             interval.tick().await;
@@ -253,11 +317,14 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
         let api_bind = cfg.api.bind_addr.clone();
         let api_port = cfg.api.port;
         let api_web_dir = web_dir.clone();
+        let api_upgrade = upgrade_manager.clone();
         if let Some(ref dir) = api_web_dir {
             info!("  Web dashboard: http://{} (serving '{}')", api_addr, dir);
         }
         tokio::spawn(async move {
-            if let Err(e) = api::run_api_server(api_state, &api_bind, api_port, api_web_dir).await {
+            if let Err(e) =
+                api::run_api_server(api_state, api_upgrade, &api_bind, api_port, api_web_dir).await
+            {
                 error!("API server error: {}", e);
             }
         });
@@ -319,6 +386,24 @@ fn resolve_advertise_addr(cfg: &crate::config::NetworkConfig) -> String {
 
     cfg.bind_addr.clone()
 }
+
+fn resolve_api_addr(cfg: &crate::config::ApiConfig, advertise_host: &str) -> String {
+    let host = if cfg.bind_addr == "0.0.0.0" || cfg.bind_addr == "::" {
+        advertise_host
+    } else {
+        &cfg.bind_addr
+    };
+    format_host_port(host, cfg.port)
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 async fn run_status_check(api_base: &str) -> Result<()> {
     let client = reqwest::Client::new();
     let url = format!("{}/api/v1/metrics", api_base);
@@ -336,4 +421,32 @@ async fn run_status_check(api_base: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ApiConfig;
+
+    #[test]
+    fn api_addr_uses_advertise_host_when_api_binds_wildcard() {
+        let cfg = ApiConfig {
+            bind_addr: "0.0.0.0".to_string(),
+            port: 7980,
+            enabled: true,
+        };
+
+        assert_eq!(resolve_api_addr(&cfg, "192.168.1.20"), "192.168.1.20:7980");
+    }
+
+    #[test]
+    fn api_addr_keeps_specific_api_bind_address() {
+        let cfg = ApiConfig {
+            bind_addr: "10.0.0.5".to_string(),
+            port: 7980,
+            enabled: true,
+        };
+
+        assert_eq!(resolve_api_addr(&cfg, "192.168.1.20"), "10.0.0.5:7980");
+    }
 }

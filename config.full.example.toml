@@ -41,6 +41,14 @@ retention_hours = 720           # 面板节点保留 30 天历史，供趋势图
 [tui]
 refresh_ms = 1000               # 终端面板刷新间隔（毫秒）
 
+[upgrade]
+enabled = true                  # 开启版本检测与 /api/v1/upgrade 自升级接口
+github_repo = "yous1r/os-watcher" # GitHub Release 仓库（owner/repo）
+check_interval_secs = 1800      # 后台检测最新版本的间隔（秒）
+package = "full"                # 默认升级带 Web 面板的完整包
+service_name = "os-watcher"     # Linux systemd / Windows 服务名
+# proxy = "http://127.0.0.1:7890" # 可选；也支持 HTTP_PROXY/HTTPS_PROXY 环境变量
+
 # ---- 告警规则 ----
 [[alerts]]
 name = "high_cpu"

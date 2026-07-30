@@ -25,6 +25,9 @@ on:
 permissions:
   contents: write
 
+env:
+  RELEASE_REPO: ${{ github.repository }}
+
 jobs:
   # ------------------------------------------------------------------ #
   #  构建前端面板（一次，产物供各平台复用）                              #
@@ -192,6 +195,7 @@ jobs:
           New-Item -ItemType Directory -Path $dist | Out-Null
           Copy-Item "target\release\os-watcher.exe" "$dist\"
           if (Test-Path README.md) { Copy-Item README.md "$dist\" }
+          if (Test-Path deploy.sh) { Copy-Item deploy.sh "$dist\" }
           Copy-Item config.node.example.toml "$dist\config.example.toml"
           Compress-Archive -Path $dist -DestinationPath "$dist.zip"
           $hash = (Get-FileHash "$dist.zip" -Algorithm SHA256).Hash.ToLower()
@@ -204,6 +208,7 @@ jobs:
           New-Item -ItemType Directory -Path $dist | Out-Null
           Copy-Item "target\release\os-watcher.exe" "$dist\"
           if (Test-Path README.md) { Copy-Item README.md "$dist\" }
+          if (Test-Path deploy.sh) { Copy-Item deploy.sh "$dist\" }
           Copy-Item config.full.example.toml "$dist\config.example.toml"
           Copy-Item web\dist "$dist\web-dist" -Recurse
           Compress-Archive -Path $dist -DestinationPath "$dist.zip"
@@ -248,3 +253,43 @@ jobs:
           files: release/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 更新 latest 标签到当前发布版本
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          target_sha="$(gh api "repos/${RELEASE_REPO}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha')"
+          target_type="$(gh api "repos/${RELEASE_REPO}/git/ref/tags/${RELEASE_TAG}" --jq '.object.type')"
+          source_type="${target_type}"
+          source_sha="${target_sha}"
+
+          while [ "${target_type}" = "tag" ]; do
+            peeled_sha="$(gh api "repos/${RELEASE_REPO}/git/tags/${target_sha}" --jq '.object.sha')"
+            peeled_type="$(gh api "repos/${RELEASE_REPO}/git/tags/${target_sha}" --jq '.object.type')"
+            target_sha="${peeled_sha}"
+            target_type="${peeled_type}"
+          done
+
+          if [ "${target_type}" != "commit" ]; then
+            echo "Release tag ${RELEASE_TAG} points to unsupported git object ${target_type}:${target_sha}" >&2
+            exit 1
+          fi
+
+          if gh api "repos/${RELEASE_REPO}/git/ref/tags/latest" >/dev/null 2>&1; then
+            gh api \
+              --method PATCH \
+              "repos/${RELEASE_REPO}/git/refs/tags/latest" \
+              -f sha="${target_sha}" \
+              -f force=true
+          else
+            gh api \
+              --method POST \
+              "repos/${RELEASE_REPO}/git/refs" \
+              -f ref="refs/tags/latest" \
+              -f sha="${target_sha}"
+          fi
+
+          echo "latest -> ${RELEASE_TAG} (${source_type}:${source_sha} peeled to ${target_type}:${target_sha})"
