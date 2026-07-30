@@ -31,7 +31,7 @@ use crate::upgrade::{UpgradeHelperRequest, UpgradeManager};
 #[command(
     name = "os-watcher",
     about = "Decentralized host resource monitor",
-    version = "0.1.0"
+    version = "0.0.7"
 )]
 struct Cli {
     /// Path to config file
