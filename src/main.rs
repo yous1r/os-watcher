@@ -305,8 +305,9 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
     // Task 2: Gossip service
     let gossip_state = Arc::clone(&state);
     let gossip_cfg = (*cfg).network.clone();
+    let gossip_db = Arc::clone(&db);
     tokio::spawn(async move {
-        if let Err(e) = GossipService::run_with_rx(gossip_state, gossip_cfg).await {
+        if let Err(e) = GossipService::run_with_rx(gossip_state, gossip_cfg, gossip_db).await {
             error!("Gossip service error: {}", e);
         }
     });
