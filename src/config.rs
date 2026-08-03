@@ -26,6 +26,9 @@ pub struct Config {
     /// Self-upgrade settings
     #[serde(default)]
     pub upgrade: UpgradeConfig,
+    /// Remote node deployment settings
+    #[serde(default)]
+    pub deploy: DeployConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +183,19 @@ pub struct UpgradeConfig {
     pub proxy: Option<String>,
 }
 
+/// Remote node deployment settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_deploy_install_dir")]
+    pub default_install_dir: String,
+    #[serde(default = "default_deploy_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_deploy_max_attempts")]
+    pub max_attempts: u32,
+}
+
 /// An alert rule definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertRule {
@@ -260,6 +276,15 @@ fn default_upgrade_check_interval() -> u64 {
 fn default_upgrade_service_name() -> String {
     "os-watcher".to_string()
 }
+fn default_deploy_install_dir() -> String {
+    "/opt/os-watcher".to_string()
+}
+fn default_deploy_connect_timeout() -> u64 {
+    20
+}
+fn default_deploy_max_attempts() -> u32 {
+    3
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -322,6 +347,7 @@ impl Default for Config {
                 refresh_ms: default_tui_refresh_ms(),
             },
             upgrade: UpgradeConfig::default(),
+            deploy: DeployConfig::default(),
         }
     }
 }
@@ -352,6 +378,17 @@ impl Default for UpgradeConfig {
             package: PackageKind::Node,
             service_name: default_upgrade_service_name(),
             proxy: None,
+        }
+    }
+}
+
+impl Default for DeployConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_install_dir: default_deploy_install_dir(),
+            connect_timeout_secs: default_deploy_connect_timeout(),
+            max_attempts: default_deploy_max_attempts(),
         }
     }
 }
@@ -453,8 +490,72 @@ mod tests {
     }
 
     #[test]
+    fn deploy_defaults_are_loaded_when_section_absent() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [node]
+            [metrics]
+            [network]
+            [api]
+            [storage]
+            "#,
+        )
+        .expect("legacy config without [deploy] should parse");
+
+        assert!(cfg.deploy.enabled);
+        assert_eq!(cfg.deploy.default_install_dir, "/opt/os-watcher");
+        assert_eq!(cfg.deploy.connect_timeout_secs, 20);
+        assert_eq!(cfg.deploy.max_attempts, 3);
+    }
+
+    #[test]
+    fn partial_deploy_section_backfills_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [node]
+            [metrics]
+            [network]
+            [api]
+            [storage]
+            [deploy]
+            enabled = false
+            "#,
+        )
+        .expect("partial [deploy] should parse");
+
+        assert!(!cfg.deploy.enabled);
+        assert_eq!(cfg.deploy.default_install_dir, "/opt/os-watcher");
+        assert_eq!(cfg.deploy.connect_timeout_secs, 20);
+        assert_eq!(cfg.deploy.max_attempts, 3);
+    }
+
+    #[test]
     fn full_template_defaults_upgrade_package_to_full() {
         let cfg = parse(FULL_CONFIG_TEMPLATE);
         assert_eq!(cfg.upgrade.package, PackageKind::Full);
+    }
+
+    #[test]
+    fn example_configs_include_deploy_defaults_and_trusted_network_warning() {
+        for template in [NODE_CONFIG_TEMPLATE, FULL_CONFIG_TEMPLATE] {
+            assert!(template.contains("[deploy]"));
+            assert!(template.contains("仅在可信网络内暴露"));
+            let cfg = parse(template);
+            assert!(cfg.deploy.enabled);
+            assert_eq!(cfg.deploy.default_install_dir, "/opt/os-watcher");
+            assert_eq!(cfg.deploy.connect_timeout_secs, 20);
+            assert_eq!(cfg.deploy.max_attempts, 3);
+        }
+    }
+
+    #[test]
+    fn readme_warns_about_unauthenticated_remote_deployment_and_links_configs() {
+        let readme = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"),
+        )
+        .expect("root README.md should exist");
+        assert!(readme.contains("仅在可信网络内暴露"));
+        assert!(readme.contains("config.node.example.toml"));
+        assert!(readme.contains("config.full.example.toml"));
     }
 }

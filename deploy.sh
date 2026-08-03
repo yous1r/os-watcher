@@ -126,11 +126,9 @@ detect_platform() {
   [[ "$(uname -s)" == "Linux" ]] || fail "当前脚本仅支持 Linux 和 Windows"
   case "$(uname -m)" in
     x86_64|amd64)
-      if ldd --version 2>&1 | grep -qi musl; then
-        printf '%s\n' "linux-x86_64-musl"
-      else
-        printf '%s\n' "linux-x86_64"
-      fi
+      # 固定使用 musl 包：静态链接，不依赖目标机 glibc 版本，远程部署最稳。
+      # 需要 gnu 包时用 --platform linux-x86_64 显式覆盖。
+      printf '%s\n' "linux-x86_64-musl"
       ;;
     aarch64|arm64)
       printf '%s\n' "linux-aarch64" ;;

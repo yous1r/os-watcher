@@ -2,25 +2,38 @@ use std::path::Path as FsPath;
 
 use anyhow::Result;
 use axum::{
-    extract::{Path, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, State,
+    },
     http::StatusCode,
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde::Serialize;
+use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info, warn};
 
+use crate::config::{DeployConfig, UpgradeConfig};
+use crate::deploy::{self, DeployRequest};
 use crate::state::SharedState;
 use crate::types::*;
 use crate::upgrade::{UpgradeManager, UpgradeRequest};
+
+const DEPLOY_EVENT_BUFFER_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 pub struct ApiState {
     nodes: SharedState,
     upgrade: UpgradeManager,
+    upgrade_config: UpgradeConfig,
+    deploy: DeployConfig,
+    /// 本机 gossip 广播地址，用于在部署请求 peers 为空时兜底注入。
+    local_gossip_addr: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,10 +177,140 @@ async fn health_check() -> impl IntoResponse {
     }))
 }
 
-pub fn create_router(state: SharedState, upgrade: UpgradeManager, web_dir: Option<&str>) -> Router {
+/// GET /api/v1/nodes/deploy — 远程节点部署的 WebSocket 端点。
+///
+/// 协议：客户端建连后发送一帧 [`DeployRequest`] JSON；服务端把部署过程的
+/// [`deploy::DeployEvent`] 逐条以文本帧回传，遇终态（success/error）后关闭。
+///
+/// 面板不引入鉴权，`[deploy] enabled = false` 时直接拒绝部署，
+/// 仅应在可信网络内暴露。
+async fn deploy_ws(State(api): State<ApiState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_deploy_socket(socket, api))
+}
+
+/// 处理已升级的部署 WebSocket 连接：读首帧请求，跑部署，转发事件。
+async fn handle_deploy_socket(mut socket: WebSocket, api: ApiState) {
+    if !api.deploy.enabled {
+        send_error_and_close(
+            &mut socket,
+            "远程部署已禁用（deploy.enabled = false）".to_string(),
+        )
+        .await;
+        return;
+    }
+
+    // 读取首帧：必须是一段 DeployRequest JSON 文本。
+    let first = match socket.recv().await {
+        Some(Ok(Message::Text(text))) => text,
+        Some(Ok(Message::Binary(bytes))) => match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                send_error_and_close(&mut socket, "首帧不是合法 UTF-8 文本".to_string()).await;
+                return;
+            }
+        },
+        // 客户端在发请求前就断开 / 关闭，无事可做。
+        _ => return,
+    };
+
+    let request: DeployRequest = match deploy::parse_request(
+        &first,
+        &api.deploy,
+        &api.upgrade_config.service_name,
+        &api.upgrade_config.github_repo,
+        &api.local_gossip_addr,
+    ) {
+        Ok(req) => req,
+        Err(e) => {
+            send_error_and_close(&mut socket, format!("部署请求解析失败：{e}")).await;
+            return;
+        }
+    };
+
+    // 有界通道把 WebSocket 的消费速度反压到 SSH 读取，避免高速日志撑爆内存。
+    let (tx, rx) = mpsc::channel::<deploy::DeployEvent>(DEPLOY_EVENT_BUFFER_CAPACITY);
+    let deploy_cfg = api.deploy.clone();
+    let local_gossip_addr = api.local_gossip_addr.clone();
+    let deploy_task = tokio::spawn(async move {
+        deploy::run_deploy(request, deploy_cfg, local_gossip_addr, tx).await;
+    });
+
+    let (sender, receiver) = socket.split();
+    relay_deploy_events(sender, receiver, rx, deploy_task).await;
+}
+
+async fn relay_deploy_events<S, R, SendError, ReceiveError>(
+    mut sender: S,
+    mut receiver: R,
+    mut events: mpsc::Receiver<deploy::DeployEvent>,
+    deploy_task: tokio::task::JoinHandle<()>,
+) where
+    S: Sink<Message, Error = SendError> + Unpin,
+    R: Stream<Item = std::result::Result<Message, ReceiveError>> + Unpin,
+{
+    loop {
+        tokio::select! {
+            client_message = receiver.next() => {
+                match client_message {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {
+                        deploy_task.abort();
+                        return;
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Some(event) => {
+                        let text = serialize_event(&event);
+                        if sender.send(Message::Text(text)).await.is_err() {
+                            deploy_task.abort();
+                            return;
+                        }
+                    }
+                    None => {
+                        let _ = sender.send(Message::Close(None)).await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 把一个部署事件序列化成 JSON 文本帧发给前端。
+async fn send_event(
+    socket: &mut WebSocket,
+    event: &deploy::DeployEvent,
+) -> Result<(), axum::Error> {
+    let text = serialize_event(event);
+    socket.send(Message::Text(text)).await
+}
+
+async fn send_error_and_close(socket: &mut WebSocket, message: String) {
+    let _ = send_event(socket, &deploy::DeployEvent::Error { message }).await;
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+fn serialize_event(event: &deploy::DeployEvent) -> String {
+    serde_json::to_string(event)
+        .unwrap_or_else(|_| r#"{"type":"error","message":"事件序列化失败"}"#.to_string())
+}
+
+pub fn create_router(
+    state: SharedState,
+    upgrade: UpgradeManager,
+    upgrade_config: UpgradeConfig,
+    deploy: DeployConfig,
+    local_gossip_addr: String,
+    web_dir: Option<&str>,
+) -> Router {
     let api_state = ApiState {
         nodes: state,
         upgrade,
+        upgrade_config,
+        deploy,
+        local_gossip_addr,
     };
 
     let api = Router::new()
@@ -179,6 +322,7 @@ pub fn create_router(state: SharedState, upgrade: UpgradeManager, web_dir: Optio
             get(get_upgrade_status).post(trigger_upgrade),
         )
         .route("/api/v1/nodes", get(list_nodes))
+        .route("/api/v1/nodes/deploy", get(deploy_ws))
         .route("/api/v1/nodes/:node_id", get(get_node))
         .route("/api/v1/nodes/:node_id/metrics", get(get_node_metrics))
         .route("/api/v1/metrics", get(get_all_metrics))
@@ -207,9 +351,13 @@ pub fn create_router(state: SharedState, upgrade: UpgradeManager, web_dir: Optio
     app.layer(CorsLayer::permissive())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_api_server(
     state: SharedState,
     upgrade: UpgradeManager,
+    upgrade_config: UpgradeConfig,
+    deploy: DeployConfig,
+    local_gossip_addr: String,
     bind_addr: &str,
     port: u16,
     web_dir: Option<String>,
@@ -218,7 +366,14 @@ pub async fn run_api_server(
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("API server listening on http://{}", addr);
 
-    let app = create_router(state, upgrade, web_dir.as_deref());
+    let app = create_router(
+        state,
+        upgrade,
+        upgrade_config,
+        deploy,
+        local_gossip_addr,
+        web_dir.as_deref(),
+    );
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -232,8 +387,20 @@ mod tests {
         http::{Request, StatusCode},
     };
     use chrono::Utc;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::connect_async;
     use tower::ServiceExt;
     use uuid::Uuid;
+
+    struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
 
     use crate::{
         config::{PackageKind, UpgradeConfig},
@@ -267,7 +434,14 @@ mod tests {
 
     #[tokio::test]
     async fn version_endpoint_returns_current_version_platform_package_and_status() {
-        let app = create_router(test_state(), test_upgrade(false), None);
+        let app = create_router(
+            test_state(),
+            test_upgrade(false),
+            UpgradeConfig::default(),
+            DeployConfig::default(),
+            "127.0.0.1:7979".to_string(),
+            None,
+        );
 
         let response = app
             .oneshot(
@@ -296,7 +470,14 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_upgrade_endpoint_rejects_without_starting_background_work() {
-        let app = create_router(test_state(), test_upgrade(false), None);
+        let app = create_router(
+            test_state(),
+            test_upgrade(false),
+            UpgradeConfig::default(),
+            DeployConfig::default(),
+            "127.0.0.1:7979".to_string(),
+            None,
+        );
 
         let response = app
             .oneshot(
@@ -320,5 +501,173 @@ mod tests {
         assert!(json["error"]
             .as_str()
             .is_some_and(|message| message.contains("disabled")));
+    }
+
+    #[tokio::test]
+    async fn disabled_deploy_upgrades_then_sends_error_and_closes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let app = create_router(
+            test_state(),
+            test_upgrade(false),
+            UpgradeConfig::default(),
+            DeployConfig {
+                enabled: false,
+                ..DeployConfig::default()
+            },
+            "127.0.0.1:7979".to_string(),
+            None,
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+
+        let (mut socket, response) = connect_async(format!("ws://{addr}/api/v1/nodes/deploy"))
+            .await
+            .expect("disabled deployment must still upgrade to websocket");
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+        let message = socket
+            .next()
+            .await
+            .expect("server should send an error frame")
+            .expect("error frame should be readable");
+        let text = message.into_text().expect("error event should be text");
+        let event: serde_json::Value = serde_json::from_str(&text).expect("event should be JSON");
+        assert_eq!(event["type"], "error");
+        assert!(event["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("禁用")));
+
+        let closed = socket.next().await;
+        assert!(closed.is_none() || closed.is_some_and(|frame| frame.is_ok_and(|m| m.is_close())));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn partial_deploy_request_is_normalized_before_validation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let app = create_router(
+            test_state(),
+            test_upgrade(false),
+            UpgradeConfig::default(),
+            DeployConfig::default(),
+            "127.0.0.1:7979".to_string(),
+            None,
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+        let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/nodes/deploy"))
+            .await
+            .expect("websocket should connect");
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{
+                    "host":"127.0.0.1",
+                    "port":0,
+                    "username":"root",
+                    "auth":{"type":"password","password":"dummy"}
+                }"#
+                .to_string(),
+            ))
+            .await
+            .expect("request should send");
+        let message = socket
+            .next()
+            .await
+            .expect("server should reply")
+            .expect("reply should be readable")
+            .into_text()
+            .expect("event should be text");
+        let event: serde_json::Value =
+            serde_json::from_str(&message).expect("event should be JSON");
+        assert_eq!(event["type"], "error");
+        assert!(event["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("参数校验失败")));
+        assert!(!event["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("请求解析失败")));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn malformed_deploy_request_sends_error_then_close_frame() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let app = create_router(
+            test_state(),
+            test_upgrade(false),
+            UpgradeConfig::default(),
+            DeployConfig::default(),
+            "127.0.0.1:7979".to_string(),
+            None,
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+        let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/nodes/deploy"))
+            .await
+            .expect("websocket should connect");
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                "{".to_string(),
+            ))
+            .await
+            .expect("malformed request should send");
+
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("error frame should arrive promptly")
+            .expect("server should send an error frame")
+            .expect("error frame should be readable");
+        let event: serde_json::Value =
+            serde_json::from_str(&message.into_text().expect("error event should be text"))
+                .expect("error event should be JSON");
+        assert_eq!(event["type"], "error");
+        assert!(event["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("请求解析失败")));
+
+        let close = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("close frame should arrive promptly")
+            .expect("server should send a close frame")
+            .expect("close frame should be readable");
+        assert!(close.is_close());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_aborts_spawned_deploy_task() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let guard = NotifyOnDrop(Some(dropped_tx));
+        let deploy_task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let client_messages =
+            futures::stream::iter([Ok::<_, std::convert::Infallible>(Message::Close(None))]);
+        let sink = futures::sink::drain();
+
+        relay_deploy_events(sink, client_messages, event_rx, deploy_task).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("deploy task should be aborted immediately on disconnect")
+            .expect("drop signal should arrive");
+        drop(event_tx);
     }
 }

@@ -13,7 +13,7 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP API
-axum = { version = "0.7", features = ["json"] }
+axum = { version = "0.7", features = ["json", "ws"] }
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 
@@ -61,6 +61,11 @@ thiserror = "1"
 # HTTP client (for status command) — rustls 避免 OpenSSL 依赖，便于 musl 静态编译与跨平台打包
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# SSH client for remote node deployment. default-features off + ring keeps the
+# build free of aws-lc-rs's cmake/C toolchain requirement, which matters for
+# musl cross-compilation.
+russh = { version = "0.62", default-features = false, features = ["ring"] }
+
 [profile.release]
 opt-level = 3
 lto = true
@@ -72,3 +77,4 @@ nix = { version = "0.29", features = ["user"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio-tungstenite = "0.24"

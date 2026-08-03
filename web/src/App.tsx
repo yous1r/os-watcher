@@ -6,12 +6,15 @@ import { formatTime } from "./format";
 import { Overview } from "./views/Overview";
 import { NodeDetail } from "./views/NodeDetail";
 import { Alerts } from "./views/Alerts";
+import { AddNodeDialog } from "./views/AddNodeDialog";
+import { deployStore } from "./deployStore";
 
 const REFRESH_MS = 3000;
 
 export default function App() {
   const [connected, setConnected] = createSignal<boolean | null>(null);
   const [lastUpdate, setLastUpdate] = createSignal("--:--:--");
+  const [addNodeOpen, setAddNodeOpen] = createSignal(false);
 
   // 轮询触发器：每个刷新周期递增，驱动 createResource 重新拉取。
   const [tick, setTick] = createSignal(0);
@@ -97,6 +100,23 @@ export default function App() {
           </span>
           <span class="sep">|</span>
           <span>{lastUpdate()}</span>
+          <button
+            type="button"
+            class="add-node-btn"
+            classList={{ deploying: deployStore.isRunning() }}
+            title={
+              deployStore.isRunning()
+                ? "部署进行中，点击查看进度"
+                : "添加节点"
+            }
+            onClick={() => setAddNodeOpen(true)}
+          >
+            {deployStore.isRunning()
+              ? "部署中…"
+              : deployStore.isActive()
+                ? "部署结果"
+                : "+ 添加节点"}
+          </button>
         </div>
       </header>
 
@@ -137,6 +157,13 @@ export default function App() {
         <span class="sep">|</span>
         <span>数据源：{API_BASE}</span>
       </footer>
+
+      <Show when={addNodeOpen()}>
+        <AddNodeDialog
+          onClose={() => setAddNodeOpen(false)}
+          onDeployed={() => setTick((t) => t + 1)}
+        />
+      </Show>
     </div>
   );
 }

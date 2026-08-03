@@ -43,11 +43,14 @@ jobs:
         with:
           node-version: "22"
 
+      - name: 启用 pnpm
+        run: corepack enable
+
       - name: 构建前端面板
         run: |
           cd web
-          npm install
-          npm run build
+          pnpm install --frozen-lockfile
+          pnpm build
 
       - name: 上传前端产物
         uses: actions/upload-artifact@v4

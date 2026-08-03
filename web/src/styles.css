@@ -112,6 +112,21 @@ body {
   border-radius: 50%;
   display: inline-block;
   position: relative;
+  /* 作为 <button> 使用时的复位 */
+  border: 0;
+  padding: 0;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+/* 状态点作为纯指示器时不显示手型光标 */
+.dot:disabled {
+  cursor: default;
+}
+
+/* 卡片状态点若为可点击的升级入口 */
+.node-card-head button.dot:not(:disabled) {
+  cursor: pointer;
 }
 
 .dot-online {
@@ -131,6 +146,22 @@ body {
 @keyframes pulse {
   0%, 100% { box-shadow: 0 0 0 3px rgba(63, 185, 80, 0.18); }
   50% { box-shadow: 0 0 0 5px rgba(63, 185, 80, 0.05); }
+}
+
+/* 有更新且在线：橙色底 + 呼吸光圈（放在状态色之后以覆盖 dot-online 等） */
+.dot-update {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px rgba(210, 153, 34, 0.2);
+  animation: pulse-update 1.8s ease-in-out infinite;
+}
+
+.dot-update:hover {
+  box-shadow: 0 0 0 5px rgba(210, 153, 34, 0.14);
+}
+
+@keyframes pulse-update {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(210, 153, 34, 0.2); }
+  50% { box-shadow: 0 0 0 6px rgba(210, 153, 34, 0.06); }
 }
 
 .alert-badge {
@@ -278,24 +309,9 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-.update-dot {
-  width: 12px;
-  height: 12px;
-  border: 0;
-  border-radius: 50%;
-  padding: 0;
-  background: var(--warn);
-  box-shadow: 0 0 0 4px rgba(210, 153, 34, 0.18);
-  cursor: pointer;
-}
-
-.update-dot:hover {
-  box-shadow: 0 0 0 6px rgba(210, 153, 34, 0.12);
-}
-
-.update-dot:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
+.node-version-new {
+  color: var(--warn);
+  font-weight: 600;
 }
 
 .node-name {
@@ -490,6 +506,22 @@ body {
 .btn-primary:disabled {
   cursor: not-allowed;
   opacity: 0.65;
+}
+
+.btn-danger {
+  min-width: 92px;
+  border: 1px solid var(--crit);
+  border-radius: 6px;
+  padding: 8px 13px;
+  background: rgba(248, 81, 73, 0.12);
+  color: var(--crit);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn-danger:hover {
+  background: rgba(248, 81, 73, 0.2);
 }
 
 /* ---------- 指标条 ---------- */
@@ -1145,4 +1177,358 @@ body {
 .io-note {
   font-size: 0.8em;
   opacity: 0.7;
+}
+
+/* ---------- 添加节点入口 ---------- */
+.add-node-btn {
+  margin-left: 14px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 5px 12px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.add-node-btn:hover {
+  background: rgba(88, 166, 255, 0.22);
+}
+
+/* 后台部署进行中的入口指示 */
+.add-node-btn.deploying {
+  border-color: var(--warn);
+  background: rgba(210, 153, 34, 0.14);
+  color: var(--warn);
+  animation: pulse-update 1.6s ease-in-out infinite;
+}
+
+.add-node-btn.deploying:hover {
+  background: rgba(210, 153, 34, 0.22);
+}
+
+/* ---------- 添加节点向导 ---------- */
+.add-node-dialog {
+  width: min(560px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-hover);
+  padding: 18px;
+}
+
+.wizard-steps {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+  margin: 0 0 18px;
+  padding: 0;
+  counter-reset: wizard;
+}
+
+.wizard-steps li {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 4px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-faint);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  counter-increment: wizard;
+}
+
+.wizard-steps li::before {
+  content: counter(wizard);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--border);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.wizard-steps li.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.wizard-steps li.active::before {
+  background: var(--accent);
+  color: #06111f;
+}
+
+.wizard-steps li.done {
+  color: var(--ok);
+  border-color: rgba(63, 185, 80, 0.4);
+}
+
+.wizard-steps li.done::before {
+  background: var(--ok);
+  color: #06111f;
+}
+
+.wizard-body {
+  margin-bottom: 16px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 14px;
+}
+
+.form-field.span-2 {
+  grid-column: 1 / -1;
+}
+
+.form-grid .form-field {
+  margin-bottom: 0;
+}
+
+.form-field > span {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.form-field input,
+.form-field textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--bg-inset);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.form-field input:focus,
+.form-field textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.form-field input:focus-visible,
+.form-field textarea:focus-visible,
+.package-toggle button:focus-visible,
+.advanced-toggle:focus-visible,
+.dialog-close:focus-visible,
+.dialog-actions button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.form-field input[aria-invalid="true"],
+.form-field textarea[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.form-field textarea.key-input {
+  resize: vertical;
+  min-height: 96px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.advanced-toggle {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 12px;
+  background: var(--bg-inset);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  margin-bottom: 14px;
+}
+
+.advanced-toggle:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.deploy-hint {
+  margin-top: 4px;
+  padding: 9px 10px;
+  border: 1px solid rgba(210, 153, 34, 0.35);
+  border-radius: 6px;
+  color: var(--warn);
+  background: rgba(210, 153, 34, 0.09);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.wizard-error {
+  margin: 0 0 12px;
+  border-left: 3px solid var(--danger);
+  padding: 8px 10px;
+  background: rgba(218, 54, 51, 0.1);
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* ---------- 部署进度 ---------- */
+.deploy-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.deploy-steps {
+  display: flex;
+  align-items: center;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.deploy-step {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.deploy-step:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  width: 100%;
+  height: 2px;
+  background: var(--border);
+  z-index: 0;
+}
+
+.deploy-step-dot {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--border);
+  position: relative;
+  z-index: 1;
+}
+
+.deploy-step.active {
+  color: var(--accent);
+}
+
+.deploy-step.active .deploy-step-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-soft);
+  animation: pulse-update 1.6s ease-in-out infinite;
+}
+
+.deploy-step.done {
+  color: var(--ok);
+}
+
+.deploy-step.done .deploy-step-dot {
+  background: var(--ok);
+}
+
+.deploy-step.done:not(:last-child)::after {
+  background: var(--ok);
+}
+
+.deploy-step.error {
+  color: var(--crit);
+}
+
+.deploy-step.error .deploy-step-dot {
+  background: var(--crit);
+}
+
+.deploy-status {
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-inset);
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.deploy-status.is-success {
+  border-color: rgba(63, 185, 80, 0.4);
+  color: var(--ok);
+  background: rgba(63, 185, 80, 0.09);
+}
+
+.deploy-status.is-error {
+  border-color: rgba(248, 81, 73, 0.4);
+  color: var(--crit);
+  background: rgba(248, 81, 73, 0.09);
+}
+
+.deploy-retry {
+  padding: 8px 11px;
+  border: 1px solid rgba(210, 153, 34, 0.35);
+  border-radius: 6px;
+  color: var(--warn);
+  background: rgba(210, 153, 34, 0.09);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.deploy-log {
+  height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-inset);
+  padding: 10px 12px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.deploy-log-empty {
+  color: var(--text-faint);
+}
+
+.deploy-log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-dim);
+}
+
+.deploy-log-line.stderr {
+  color: var(--crit);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dot-update,
+  .add-node-btn.deploying,
+  .deploy-step.active .deploy-step-dot {
+    animation: none;
+  }
 }
