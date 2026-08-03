@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "os-watcher 去中心化主机监控前端面板",
   "type": "module",
+  "packageManager": "pnpm@10.24.0",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

@@ -208,3 +208,38 @@ export interface ApiResponse<T> {
   data: T;
   error?: string;
 }
+
+// ---------- 远程节点部署 ----------
+
+/** SSH 认证方式：密码或私钥。 */
+export type DeployAuth =
+  | { type: "password"; password: string }
+  | { type: "key"; private_key: string; passphrase: string | null };
+
+/** 部署请求首帧，通过 WebSocket 发送给后端。 */
+export interface DeployRequest {
+  host: string;
+  port: number;
+  username: string;
+  auth: DeployAuth;
+  package: PackageKind;
+  api_port: number;
+  gossip_port: number;
+  peers: string[];
+  service_name: string;
+  install_dir: string;
+  version: string;
+  repo: string | null;
+  proxy: string | null;
+}
+
+/** 部署阶段，对应后端 progress 事件的 step。 */
+export type DeployStep = "connecting" | "uploading" | "installing" | "verifying";
+
+/** 后端流式返回的部署事件，`type` 为标签。 */
+export type DeployEvent =
+  | { type: "progress"; step: DeployStep; message: string }
+  | { type: "log"; stream: "stdout" | "stderr"; line: string }
+  | { type: "retry"; attempt: number; max: number; message: string }
+  | { type: "success"; message: string }
+  | { type: "error"; message: string };

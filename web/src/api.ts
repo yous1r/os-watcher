@@ -56,6 +56,11 @@ export function fetchSnapshots(): Promise<NodeSnapshot[]> {
   return getJson<NodeSnapshot[]>("/metrics");
 }
 
+/** 拉取本机节点信息（含 gossip 地址），用于部署向导预填 peers。 */
+export function fetchLocal(): Promise<NodeSnapshot> {
+  return getJson<NodeSnapshot>("/local");
+}
+
 /** 拉取当前活动告警。 */
 export function fetchAlerts(): Promise<Alert[]> {
   return getJson<Alert[]>("/alerts");
@@ -88,6 +93,30 @@ function apiBaseForNode(apiAddr: string): string {
     url.hostname = window.location.hostname;
   }
   return `${url.origin}/api/v1`;
+}
+
+/** 计算部署 WebSocket 端点的绝对 URL，复用 API_BASE 的 host 解析思路。 */
+function deployWebSocketUrl(): string {
+  // API_BASE 可能是绝对地址（VITE_API_BASE）或相对路径（默认 /api/v1）。
+  if (/^https?:\/\//i.test(API_BASE)) {
+    const url = new URL(API_BASE);
+    if (url.hostname === "0.0.0.0" || url.hostname === "::") {
+      url.hostname = window.location.hostname;
+    }
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.pathname = `${url.pathname.replace(/\/$/, "")}/nodes/deploy`;
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  }
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const base = API_BASE.replace(/\/$/, "");
+  return `${proto}//${window.location.host}${base}/nodes/deploy`;
+}
+
+/** 建立部署 WebSocket 连接；调用方负责在 onopen 时发送 DeployRequest 首帧。 */
+export function openDeployWebSocket(): WebSocket {
+  return new WebSocket(deployWebSocketUrl());
 }
 
 export { API_BASE };

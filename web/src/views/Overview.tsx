@@ -172,12 +172,34 @@ export function Overview(props: {
               return (
                 <div class="node-card" classList={{ offline: !online }}>
                   <div class="node-card-head">
-                    <span
+                    <button
+                      type="button"
                       class="dot"
                       classList={{
                         "dot-online": snap.info.status === "Online",
                         "dot-offline": snap.info.status === "Offline",
                         "dot-unknown": snap.info.status === "Unknown",
+                        "dot-update": updateAvailable(snap) && online,
+                      }}
+                      disabled={
+                        !updateAvailable(snap) ||
+                        !online ||
+                        isUpgradeLocked(snap.info.id)
+                      }
+                      title={
+                        updateAvailable(snap) && online
+                          ? `发现新版本 ${latestVersion()}，点击升级`
+                          : undefined
+                      }
+                      aria-label={
+                        updateAvailable(snap) && online
+                          ? `升级 ${snap.info.hostname}`
+                          : `节点 ${snap.info.hostname} 状态`
+                      }
+                      onClick={() => {
+                        if (updateAvailable(snap) && online) {
+                          openUpgradeDialog(snap);
+                        }
                       }}
                     />
                     <span class="node-name">{snap.info.hostname}</span>
@@ -186,14 +208,7 @@ export function Overview(props: {
                   <div class="node-version">
                     <span>版本 {snap.info.version}</span>
                     <Show when={updateAvailable(snap)}>
-                      <button
-                        type="button"
-                        class="update-dot"
-                        title={`发现新版本 ${latestVersion()}`}
-                        aria-label={`升级 ${snap.info.hostname}`}
-                        disabled={!online || isUpgradeLocked(snap.info.id)}
-                        onClick={() => openUpgradeDialog(snap)}
-                      />
+                      <span class="node-version-new">→ {latestVersion()}</span>
                     </Show>
                   </div>
                   <Show

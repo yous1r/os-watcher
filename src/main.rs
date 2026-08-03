@@ -2,6 +2,7 @@ mod alerts;
 mod api;
 mod collector;
 mod config;
+mod deploy;
 mod disk_health;
 mod diskstats;
 mod gossip;
@@ -22,7 +23,7 @@ use uuid::Uuid;
 
 use crate::collector::MetricsCollector;
 use crate::config::{generate_default_config, load_config, Config, ConfigProfile, PackageKind};
-use crate::gossip::{GossipService, broadcast_leave};
+use crate::gossip::{broadcast_leave, GossipService};
 use crate::state::new_shared_state;
 use crate::types::{NodeInfo, NodeStatus};
 use crate::upgrade::{UpgradeHelperRequest, UpgradeManager};
@@ -31,7 +32,7 @@ use crate::upgrade::{UpgradeHelperRequest, UpgradeManager};
 #[command(
     name = "os-watcher",
     about = "Decentralized host resource monitor",
-    version = "0.0.7"
+    version = env!("CARGO_PKG_VERSION")
 )]
 struct Cli {
     /// Path to config file
@@ -304,7 +305,7 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
 
     // Task 2: Gossip service
     let gossip_state = Arc::clone(&state);
-    let gossip_cfg = (*cfg).network.clone();
+    let gossip_cfg = cfg.network.clone();
     let gossip_db = Arc::clone(&db);
     tokio::spawn(async move {
         if let Err(e) = GossipService::run_with_rx(gossip_state, gossip_cfg, gossip_db).await {
@@ -319,12 +320,24 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
         let api_port = cfg.api.port;
         let api_web_dir = web_dir.clone();
         let api_upgrade = upgrade_manager.clone();
+        let api_upgrade_config = cfg.upgrade.clone();
+        let api_deploy = cfg.deploy.clone();
+        let api_gossip_addr = gossip_addr.clone();
         if let Some(ref dir) = api_web_dir {
             info!("  Web dashboard: http://{} (serving '{}')", api_addr, dir);
         }
         tokio::spawn(async move {
-            if let Err(e) =
-                api::run_api_server(api_state, api_upgrade, &api_bind, api_port, api_web_dir).await
+            if let Err(e) = api::run_api_server(
+                api_state,
+                api_upgrade,
+                api_upgrade_config,
+                api_deploy,
+                api_gossip_addr,
+                &api_bind,
+                api_port,
+                api_web_dir,
+            )
+            .await
             {
                 error!("API server error: {}", e);
             }
