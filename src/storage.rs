@@ -147,13 +147,13 @@ impl Database {
 
     async fn enforce_startup_size_limit(&self) -> Result<()> {
         let original = self.page_stats().await?;
-        if original.file_bytes()? > self.max_size_bytes {
+        let final_stats = if original.file_bytes()? > self.max_size_bytes {
             let target_bytes = self
                 .max_size_bytes
                 .checked_mul(9)
                 .ok_or_else(|| anyhow!("database shrink target overflow"))?
                 / 10;
-            let mut deleted = 0_u64;
+            let mut deleted_before_compaction = 0_u64;
             let mut stats = original;
 
             loop {
@@ -163,14 +163,9 @@ impl Database {
                 }
 
                 let metric_count = self.metrics_history_count().await?;
-                ensure!(
-                    metric_count > 0,
-                    "database exceeds its startup shrink target but has no metric history to evict"
-                );
-
-                // Keep the newest record when protected data plus that record
-                // already fits the hard cap, even if it cannot provide 10% headroom.
-                if metric_count == 1 && used_bytes <= self.max_size_bytes {
+                // Fragmented pre-compaction page usage cannot determine whether
+                // protected data, or protected data plus the newest metric, fits.
+                if metric_count <= 1 {
                     break;
                 }
 
@@ -180,24 +175,55 @@ impl Database {
                     batch > 0,
                     "database exceeds its startup shrink target but has no metric history to evict"
                 );
-                deleted = deleted
+                deleted_before_compaction = deleted_before_compaction
                     .checked_add(batch)
                     .ok_or_else(|| anyhow!("evicted metric count overflow"))?;
                 stats = self.page_stats().await?;
             }
 
             sqlx::query("VACUUM").execute(&self.pool).await?;
+            let stats_after_first_compaction = self.page_stats().await?;
+            let mut deleted_after_compaction = 0_u64;
+            let final_compaction_stats =
+                if stats_after_first_compaction.file_bytes()? > self.max_size_bytes {
+                    let metric_count = self.metrics_history_count().await?;
+                    if metric_count == 1 {
+                        let batch = self.delete_oldest_metrics_batch(1).await?;
+                        ensure!(
+                            batch == 1,
+                            "database remains above its size limit after compaction but the sole metric could not be evicted"
+                        );
+                        deleted_after_compaction = deleted_after_compaction
+                            .checked_add(batch)
+                            .ok_or_else(|| anyhow!("evicted metric count overflow"))?;
+
+                        // Rare correctness path: only compacted size proves that
+                        // the newest metric itself cannot coexist with protected data.
+                        sqlx::query("VACUUM").execute(&self.pool).await?;
+                        self.page_stats().await?
+                    } else {
+                        stats_after_first_compaction
+                    }
+                } else {
+                    stats_after_first_compaction
+                };
             warn!(
-                "Evicted {} old metric records while shrinking database",
-                deleted
+                "Startup database compaction deleted {deleted_before_compaction} metric records before the first VACUUM and {deleted_after_compaction} after it"
             );
-        }
+
+            final_compaction_stats
+        } else {
+            original
+        };
 
         let applied = {
             let mut connection = self.pool.acquire().await?;
             apply_max_page_count(&mut connection, self.max_size_bytes).await?
         };
-        let final_stats = self.page_stats().await?;
+        ensure!(
+            final_stats.file_bytes()? <= self.max_size_bytes,
+            "database remains above size limit after metric eviction; protected data cannot fit"
+        );
         let allowed_pages = self.max_size_bytes / final_stats.page_size;
         ensure!(
             applied <= allowed_pages,
@@ -206,10 +232,6 @@ impl Database {
         ensure!(
             final_stats.page_count <= applied,
             "database page count exceeds its applied page limit"
-        );
-        ensure!(
-            final_stats.file_bytes()? <= self.max_size_bytes,
-            "database remains above size limit after metric eviction; protected data cannot fit"
         );
         Ok(())
     }
@@ -484,10 +506,20 @@ mod tests {
         }
         assert!(database_bytes(&db).await > LIMIT);
         db.pool.close().await;
+        let oversized_file_bytes = std::fs::metadata(path).unwrap().len();
+        assert!(
+            oversized_file_bytes > LIMIT,
+            "setup file length {oversized_file_bytes} did not exceed limit {LIMIT}"
+        );
 
         let db = Database::new_with_max_size(path, LIMIT).await.unwrap();
 
         assert!(database_bytes(&db).await <= LIMIT);
+        let compacted_file_bytes = std::fs::metadata(path).unwrap().len();
+        assert!(
+            compacted_file_bytes <= LIMIT,
+            "compacted file length {compacted_file_bytes} exceeds limit {LIMIT}"
+        );
         let newest: String = sqlx::query_scalar(
             "SELECT hostname FROM metrics_history ORDER BY timestamp DESC, id DESC LIMIT 1",
         )
@@ -495,5 +527,180 @@ mod tests {
         .await
         .unwrap();
         assert!(newest.starts_with("079-"));
+    }
+
+    #[tokio::test]
+    async fn opening_oversized_protected_database_without_metrics_compacts() {
+        const LIMIT: u64 = 256 * 1024;
+        const TARGET: u64 = LIMIT * 9 / 10;
+        const MAX_ALERT_ROWS: i64 = 256;
+        const MAX_METRIC_ROWS: i64 = 64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("protected-oversized.db");
+        let path = path.to_str().unwrap();
+        let db = Database::new_with_max_size(path, 4 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        let alert_message = "a".repeat(2 * 1024);
+        let mut alert_count = 0_i64;
+        let mut protected_stats = db.page_stats().await.unwrap();
+        for index in 0..MAX_ALERT_ROWS {
+            if protected_stats.used_bytes().unwrap() > TARGET {
+                break;
+            }
+
+            sqlx::query(
+                r#"INSERT INTO alerts_log
+                   (id, node_id, rule_name, severity, message, triggered_at,
+                    resolved_at, value, threshold)
+                   VALUES (?, 'protected-node', 'protected-rule', 'warning', ?, ?,
+                           NULL, 1.0, 2.0)"#,
+            )
+            .bind(format!("alert-{index:03}"))
+            .bind(&alert_message)
+            .bind(Utc.timestamp_opt(index, 0).unwrap().to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            alert_count += 1;
+            protected_stats = db.page_stats().await.unwrap();
+        }
+
+        let protected_used_bytes = protected_stats.used_bytes().unwrap();
+        assert!(alert_count > 0, "setup did not insert protected alert rows");
+        assert!(
+            protected_used_bytes > TARGET,
+            "bounded alert setup reached only {protected_used_bytes} live bytes; target is {TARGET}"
+        );
+        assert!(
+            protected_used_bytes < LIMIT,
+            "protected rows use {protected_used_bytes} bytes and do not fit below limit {LIMIT}"
+        );
+
+        let mut metric_count = 0_i64;
+        let mut expanded_file_bytes = protected_stats.file_bytes().unwrap();
+        for index in 0..MAX_METRIC_ROWS {
+            if expanded_file_bytes > LIMIT {
+                break;
+            }
+
+            let timestamp = Utc
+                .timestamp_opt(10_000 + index, 0)
+                .unwrap()
+                .to_rfc3339();
+            insert_raw_metric(
+                &db,
+                &timestamp,
+                &format!("metric-{index:03}-{}", "m".repeat(8 * 1024)),
+            )
+            .await;
+            metric_count += 1;
+            expanded_file_bytes = database_bytes(&db).await;
+        }
+
+        assert!(metric_count > 0, "setup did not insert metric rows");
+        assert!(
+            expanded_file_bytes > LIMIT,
+            "bounded metric setup reached only {expanded_file_bytes} file bytes; limit is {LIMIT}"
+        );
+
+        let deleted = sqlx::query("DELETE FROM metrics_history")
+            .execute(&db.pool)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(deleted, metric_count as u64);
+
+        let post_delete_stats = db.page_stats().await.unwrap();
+        let post_delete_used_bytes = post_delete_stats.used_bytes().unwrap();
+        assert!(
+            post_delete_stats.file_bytes().unwrap() > LIMIT,
+            "deleting metrics unexpectedly removed the physical oversize precondition"
+        );
+        assert!(
+            post_delete_stats.freelist_count > 0,
+            "deleting metrics did not leave free pages for compaction"
+        );
+        assert!(
+            post_delete_used_bytes > TARGET,
+            "protected live data uses only {post_delete_used_bytes} bytes; target is {TARGET}"
+        );
+        assert!(
+            post_delete_used_bytes < LIMIT,
+            "protected live data uses {post_delete_used_bytes} bytes and cannot fit below {LIMIT}"
+        );
+        let remaining_metrics: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM metrics_history")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining_metrics, 0);
+
+        db.pool.close().await;
+        let oversized_file_bytes = std::fs::metadata(path).unwrap().len();
+        assert!(
+            oversized_file_bytes > LIMIT,
+            "setup file length {oversized_file_bytes} did not exceed limit {LIMIT}"
+        );
+
+        let db = Database::new_with_max_size(path, LIMIT)
+            .await
+            .expect("oversized protected data with no metrics should be compacted, not rejected");
+
+        let compacted_file_bytes = std::fs::metadata(path).unwrap().len();
+        assert!(
+            compacted_file_bytes <= LIMIT,
+            "compacted file length {compacted_file_bytes} exceeds limit {LIMIT}"
+        );
+        let remaining_alerts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alerts_log")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining_alerts, alert_count);
+        let remaining_metrics: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM metrics_history")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining_metrics, 0);
+    }
+
+    #[tokio::test]
+    async fn file_pool_applies_max_page_count_to_every_connection() {
+        const LIMIT: u64 = 256 * 1024;
+        const POOL_SIZE: usize = 5;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pooled.db");
+        let db = Database::new_with_max_size(path.to_str().unwrap(), LIMIT)
+            .await
+            .unwrap();
+
+        let mut connections = Vec::with_capacity(POOL_SIZE);
+        for _ in 0..POOL_SIZE {
+            connections.push(db.pool.acquire().await.unwrap());
+        }
+        assert_eq!(connections.len(), POOL_SIZE);
+
+        for (index, connection) in connections.iter_mut().enumerate() {
+            let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+                .fetch_one(&mut **connection)
+                .await
+                .unwrap();
+            let max_page_count: i64 = sqlx::query_scalar("PRAGMA max_page_count")
+                .fetch_one(&mut **connection)
+                .await
+                .unwrap();
+            let page_size = u64::try_from(page_size).unwrap();
+            let max_page_count = u64::try_from(max_page_count).unwrap();
+            assert!(page_size > 0, "connection {index} returned a zero page size");
+            assert_eq!(
+                max_page_count,
+                LIMIT / page_size,
+                "connection {index} has the wrong maximum page count"
+            );
+        }
     }
 }
