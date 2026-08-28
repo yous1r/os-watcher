@@ -53,6 +53,9 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_metrics_node_time
                 ON metrics_history(node_id, timestamp);
 
+            CREATE INDEX IF NOT EXISTS idx_metrics_time
+                ON metrics_history(timestamp, id);
+
             CREATE TABLE IF NOT EXISTS alerts_log (
                 id TEXT PRIMARY KEY,
                 node_id TEXT NOT NULL,
@@ -174,6 +177,22 @@ impl Database {
         Ok(())
     }
 
+    async fn delete_oldest_metrics_batch(&self, limit: i64) -> Result<u64> {
+        let result = sqlx::query(r#"
+            DELETE FROM metrics_history
+            WHERE id IN (
+                SELECT id FROM metrics_history
+                ORDER BY timestamp ASC, id ASC
+                LIMIT ?
+            )
+        "#)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
     /// Delete metrics older than retention_hours
     pub async fn cleanup_old_metrics(&self, retention_hours: u64) -> Result<u64> {
         let cutoff = Utc::now() - chrono::Duration::hours(retention_hours as i64);
@@ -187,5 +206,60 @@ impl Database {
         .await?;
 
         Ok(result.rows_affected())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use tempfile::TempDir;
+
+    async fn temp_database() -> (TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        (dir, db)
+    }
+
+    async fn insert_raw_metric(db: &Database, timestamp: &str, hostname: &str) {
+        sqlx::query(
+            r#"INSERT INTO metrics_history
+               (node_id, hostname, timestamp, cpu_usage, memory_usage,
+                memory_used_bytes, memory_total_bytes, uptime_seconds, raw_json)
+               VALUES (?, ?, ?, 0, 0, 0, 0, 0, '{}')"#,
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(hostname)
+        .bind(timestamp)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_oldest_metrics_orders_by_timestamp_then_id() {
+        let (_dir, db) = temp_database().await;
+        let same_time = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        insert_raw_metric(&db, &same_time.to_rfc3339(), "older-id").await;
+        insert_raw_metric(&db, &same_time.to_rfc3339(), "newer-id").await;
+        insert_raw_metric(
+            &db,
+            &Utc
+                .with_ymd_and_hms(2026, 1, 3, 0, 0, 0)
+                .unwrap()
+                .to_rfc3339(),
+            "newest-time",
+        )
+        .await;
+
+        assert_eq!(db.delete_oldest_metrics_batch(2).await.unwrap(), 2);
+
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT hostname FROM metrics_history ORDER BY timestamp, id")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, vec!["newest-time"]);
     }
 }
