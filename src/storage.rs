@@ -6,6 +6,8 @@ use tracing::info;
 
 use crate::types::*;
 
+const EVICTION_BATCH_SIZE: i64 = 10_000;
+
 pub struct Database {
     pool: SqlitePool,
 }
@@ -240,18 +242,27 @@ mod tests {
     #[tokio::test]
     async fn delete_oldest_metrics_orders_by_timestamp_then_id() {
         let (_dir, db) = temp_database().await;
+        let older_time = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let same_time = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let newer_time = Utc.with_ymd_and_hms(2026, 1, 3, 0, 0, 0).unwrap();
+
+        // Make ID order disagree with timestamp order, then make timestamp-only
+        // scans prefer descending IDs so both ORDER BY terms are independently required.
         insert_raw_metric(&db, &same_time.to_rfc3339(), "older-id").await;
         insert_raw_metric(&db, &same_time.to_rfc3339(), "newer-id").await;
-        insert_raw_metric(
-            &db,
-            &Utc
-                .with_ymd_and_hms(2026, 1, 3, 0, 0, 0)
-                .unwrap()
-                .to_rfc3339(),
-            "newest-time",
+        insert_raw_metric(&db, &older_time.to_rfc3339(), "oldest-time").await;
+        insert_raw_metric(&db, &newer_time.to_rfc3339(), "newest-time").await;
+
+        sqlx::query("DROP INDEX idx_metrics_time")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE INDEX idx_metrics_time_desc_id ON metrics_history(timestamp ASC, id DESC)",
         )
-        .await;
+        .execute(&db.pool)
+        .await
+        .unwrap();
 
         assert_eq!(db.delete_oldest_metrics_batch(2).await.unwrap(), 2);
 
@@ -260,6 +271,6 @@ mod tests {
                 .fetch_all(&db.pool)
                 .await
                 .unwrap();
-        assert_eq!(remaining, vec!["newest-time"]);
+        assert_eq!(remaining, vec!["newer-id", "newest-time"]);
     }
 }
