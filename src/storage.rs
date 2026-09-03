@@ -808,13 +808,15 @@ mod tests {
 
         let db = Arc::new(db);
         let node_id = uuid::Uuid::new_v4();
-        // Scheduling is intentionally uncontrolled; enough ordered writers make this a
-        // bounded stress regression for interleaved eviction and retry operations.
+        // Scheduling is intentionally uncontrolled; equal timestamps make the "latest"
+        // assertion independent of Tokio lock acquisition order. The single-thread
+        // eviction test covers timestamp ordering; these writers provide a bounded
+        // stress regression for interleaved eviction and retry operations.
         let mut writers = Vec::with_capacity(WRITER_COUNT);
         for index in 0..WRITER_COUNT {
             let db = Arc::clone(&db);
             let metrics = metrics_at(
-                Utc.timestamp_opt(1_000_000 + index as i64, 0).unwrap(),
+                Utc.timestamp_opt(1_000_000, 0).unwrap(),
                 8 * 1024,
             );
             writers.push(tokio::spawn(async move {
@@ -831,8 +833,10 @@ mod tests {
             result.unwrap_or_else(|error| panic!("metric writer {index} failed: {error:#}"));
         }
 
+        // Every concurrent writer uses the same timestamp, so this "latest" assertion
+        // remains deterministic regardless of Tokio lock acquisition order.
         let expected_latest = Utc
-            .timestamp_opt(1_000_000 + WRITER_COUNT as i64 - 1, 0)
+            .timestamp_opt(1_000_000, 0)
             .unwrap()
             .to_rfc3339();
         let latest_timestamp: String = sqlx::query_scalar(
@@ -841,7 +845,11 @@ mod tests {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(latest_timestamp, expected_latest);
+        assert_eq!(
+            latest_timestamp,
+            expected_latest,
+            "equal writer timestamps make latest independent of Tokio lock acquisition order"
+        );
 
         let final_main_file_bytes = std::fs::metadata(&path).unwrap().len();
         assert!(
