@@ -503,6 +503,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_old_metrics_only_removes_expired_rows() {
+        let (_dir, db) = temp_database().await;
+        insert_raw_metric(
+            &db,
+            &(Utc::now() - chrono::Duration::hours(48)).to_rfc3339(),
+            "expired",
+        )
+        .await;
+        insert_raw_metric(&db, &Utc::now().to_rfc3339(), "current").await;
+
+        assert_eq!(db.cleanup_old_metrics(24).await.unwrap(), 1);
+        let remaining: Vec<String> = sqlx::query_scalar("SELECT hostname FROM metrics_history")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, vec!["current"]);
+    }
+
+    #[tokio::test]
     async fn delete_oldest_metrics_orders_by_timestamp_then_id() {
         let (_dir, db) = temp_database().await;
         let older_time = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
