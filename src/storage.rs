@@ -257,8 +257,9 @@ impl Database {
                 } else {
                     stats_after_first_compaction
                 };
+            let final_file_bytes = final_compaction_stats.file_bytes()?;
             warn!(
-                "Startup database compaction deleted {deleted_before_compaction} metric records before the first VACUUM and {deleted_after_compaction} after it"
+                "Startup database compaction deleted {deleted_before_compaction} metric records before the first VACUUM and {deleted_after_compaction} after it; final compacted main-file size is {final_file_bytes} bytes"
             );
 
             final_compaction_stats
@@ -864,6 +865,16 @@ mod tests {
             .unwrap();
 
         let alert_message = "a".repeat(2 * 1024);
+
+        sqlx::query(
+            r#"INSERT INTO nodes_seen
+               (id, hostname, api_addr, gossip_addr, last_seen, version)
+               VALUES ('protected-node', 'protected-host', '127.0.0.1:1',
+                       '127.0.0.1:2', '1970-01-01T00:00:00+00:00', 'test')"#,
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
         let mut alert_count = 0_i64;
         let mut protected_stats = db.page_stats().await.unwrap();
         for index in 0..MAX_ALERT_ROWS {
@@ -979,6 +990,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining_alerts, alert_count);
+        let remaining_nodes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes_seen")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining_nodes, 1);
+        let remaining_node_id: String = sqlx::query_scalar("SELECT id FROM nodes_seen")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining_node_id, "protected-node");
         let remaining_metrics: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM metrics_history")
                 .fetch_one(&db.pool)
