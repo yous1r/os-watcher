@@ -70,6 +70,17 @@ async fn apply_max_page_count(
         .map_err(|_| sqlx::Error::Protocol("SQLite returned a negative max page count".into()))
 }
 
+/// Classify a sqlx error as SQLITE_FULL (extended code 13).
+/// Matches on the database error code, never on message text, so lock
+/// conflicts, corruption, or other I/O failures are never treated as full.
+fn is_database_full(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(database_error)
+            if database_error.code().as_deref() == Some("13")
+    )
+}
+
 impl Database {
     pub async fn new(db_path: &str) -> Result<Self> {
         Self::new_with_max_size(db_path, MAX_DATABASE_BYTES).await
@@ -290,25 +301,39 @@ impl Database {
         let ts = metrics.timestamp.to_rfc3339();
         let raw = serde_json::to_string(metrics)?;
 
-        sqlx::query(r#"
-            INSERT INTO metrics_history
-                (node_id, hostname, timestamp, cpu_usage, memory_usage,
-                 memory_used_bytes, memory_total_bytes, uptime_seconds, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#)
-        .bind(&node_id_str)
-        .bind(&metrics.hostname)
-        .bind(&ts)
-        .bind(metrics.cpu.usage_percent as f64)
-        .bind(metrics.memory.usage_percent as f64)
-        .bind(metrics.memory.used_bytes as i64)
-        .bind(metrics.memory.total_bytes as i64)
-        .bind(metrics.uptime_seconds as i64)
-        .bind(&raw)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+        loop {
+            match sqlx::query(r#"
+                INSERT INTO metrics_history
+                    (node_id, hostname, timestamp, cpu_usage, memory_usage,
+                     memory_used_bytes, memory_total_bytes, uptime_seconds, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#)
+            .bind(&node_id_str)
+            .bind(&metrics.hostname)
+            .bind(&ts)
+            .bind(metrics.cpu.usage_percent as f64)
+            .bind(metrics.memory.usage_percent as f64)
+            .bind(metrics.memory.used_bytes as i64)
+            .bind(metrics.memory.total_bytes as i64)
+            .bind(metrics.uptime_seconds as i64)
+            .bind(&raw)
+            .execute(&self.pool)
+            .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) if is_database_full(&error) => {
+                    let deleted = self.delete_oldest_metrics_batch(EVICTION_BATCH_SIZE).await?;
+                    if deleted == 0 {
+                        return Err(error.into());
+                    }
+                    warn!(
+                        "Database full; evicted {} oldest metric records",
+                        deleted
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     /// Get recent metrics for a node
@@ -448,6 +473,33 @@ mod tests {
             .await
             .unwrap();
         page_size as u64 * page_count as u64
+    }
+
+    fn metrics_at(timestamp: chrono::DateTime<Utc>, payload_bytes: usize) -> SystemMetrics {
+        SystemMetrics {
+            timestamp,
+            cpu: CpuMetrics {
+                usage_percent: 0.0,
+                core_usages: vec![],
+                core_count: 1,
+            },
+            memory: MemoryMetrics {
+                total_bytes: 1,
+                used_bytes: 0,
+                available_bytes: 1,
+                usage_percent: 0.0,
+                swap_total_bytes: 0,
+                swap_used_bytes: 0,
+            },
+            disks: vec![],
+            physical_disks: vec![],
+            networks: vec![],
+            load_average: None,
+            top_processes: vec![],
+            uptime_seconds: 0,
+            os_name: "test".to_string(),
+            hostname: "x".repeat(payload_bytes),
+        }
     }
 
     #[tokio::test]
@@ -665,6 +717,57 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(remaining_metrics, 0);
+    }
+
+    #[tokio::test]
+    async fn full_database_evicts_oldest_and_keeps_latest_metric() {
+        const LIMIT: u64 = 256 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full.db");
+        let db = Database::new_with_max_size(path.to_str().unwrap(), LIMIT)
+            .await
+            .unwrap();
+        let node_id = uuid::Uuid::new_v4();
+
+        for second in 0..80 {
+            let metrics = metrics_at(Utc.timestamp_opt(second, 0).unwrap(), 8 * 1024);
+            db.store_metrics(&node_id, &metrics).await.unwrap();
+        }
+
+        let page_bytes = database_bytes(&db).await;
+        assert!(
+            page_bytes <= LIMIT,
+            "database page bytes {page_bytes} exceed limit {LIMIT}"
+        );
+        let main_file_bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            main_file_bytes <= LIMIT,
+            "main database file uses {main_file_bytes} bytes; limit is {LIMIT}"
+        );
+
+        let latest_timestamp: String = sqlx::query_scalar(
+            "SELECT timestamp FROM metrics_history ORDER BY timestamp DESC, id DESC LIMIT 1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let expected_latest = Utc.timestamp_opt(79, 0).unwrap().to_rfc3339();
+        assert_eq!(latest_timestamp, expected_latest);
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metrics_history")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert!(count < 80, "the quota must evict at least one old metric");
+
+        let oldest_timestamp = Utc.timestamp_opt(0, 0).unwrap().to_rfc3339();
+        let oldest_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM metrics_history WHERE timestamp = ?")
+                .bind(oldest_timestamp)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(oldest_count, 0, "the oldest metric must be evicted");
     }
 
     #[tokio::test]
