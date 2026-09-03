@@ -1,5 +1,6 @@
 use anyhow::{anyhow, ensure, Result};
 use sqlx::{sqlite::SqlitePoolOptions, SqliteConnection, SqlitePool};
+use tokio::sync::Mutex;
 use std::time::Duration;
 use chrono::Utc;
 use tracing::{info, warn};
@@ -13,6 +14,7 @@ const EVICTION_BATCH_SIZE: i64 = 10_000;
 pub struct Database {
     pool: SqlitePool,
     max_size_bytes: u64,
+    metrics_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,14 +97,53 @@ impl Database {
         } else {
             format!("sqlite://{}?mode=rwc", db_path)
         };
-        let max_connections = if db_path == ":memory:" { 1 } else { 5 };
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(max_connections)
-            // Release idle connections after 30 s so they don't accumulate.
+        if db_path == ":memory:" {
+            // An in-memory database must stay on one connection.  Run migrations
+            // before applying the cap because the migration may add an index.
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                // Release idle connections after 30 s so they don't accumulate.
+                .idle_timeout(Duration::from_secs(30))
+                // If all connections are busy, fail fast rather than blocking
+                // indefinitely — the caller logs the error and moves on.
+                .acquire_timeout(Duration::from_secs(5))
+                .connect(&url)
+                .await?;
+            let db = Self {
+                pool,
+                max_size_bytes,
+                metrics_lock: Mutex::new(()),
+            };
+            db.run_migrations().await?;
+            db.enforce_startup_size_limit().await?;
+            info!("Database initialized at {}", db_path);
+            return Ok(db);
+        }
+
+        // Existing file databases may be exactly at their old page cap while
+        // missing a migration-created index.  Bootstrap on one uncapped
+        // connection so migration and startup compaction can finish first.
+        let bootstrap_pool = SqlitePoolOptions::new()
+            .max_connections(1)
             .idle_timeout(Duration::from_secs(30))
-            // If all connections are busy, fail fast rather than blocking
-            // indefinitely — the caller logs the error and moves on.
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(&url)
+            .await?;
+        let bootstrap = Self {
+            pool: bootstrap_pool,
+            max_size_bytes,
+            metrics_lock: Mutex::new(()),
+        };
+        bootstrap.run_migrations().await?;
+        bootstrap.enforce_startup_size_limit().await?;
+        bootstrap.pool.close().await;
+
+        // Every connection in the steady-state file-backed pool receives the
+        // per-connection cap, including connections opened lazily after init.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .idle_timeout(Duration::from_secs(30))
             .acquire_timeout(Duration::from_secs(5))
             .after_connect(move |connection, _metadata| {
                 Box::pin(async move {
@@ -113,13 +154,11 @@ impl Database {
             })
             .connect(&url)
             .await?;
-
         let db = Self {
             pool,
             max_size_bytes,
+            metrics_lock: Mutex::new(()),
         };
-        db.run_migrations().await?;
-        db.enforce_startup_size_limit().await?;
         info!("Database initialized at {}", db_path);
         Ok(db)
     }
@@ -297,6 +336,7 @@ impl Database {
 
     /// Store a metrics snapshot
     pub async fn store_metrics(&self, node_id: &NodeId, metrics: &SystemMetrics) -> Result<()> {
+        let _metrics_guard = self.metrics_lock.lock().await;
         let node_id_str = node_id.to_string();
         let ts = metrics.timestamp.to_rfc3339();
         let raw = serde_json::to_string(metrics)?;
@@ -439,6 +479,7 @@ impl Database {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     async fn temp_database() -> (TempDir, Database) {
@@ -448,7 +489,7 @@ mod tests {
         (dir, db)
     }
 
-    async fn insert_raw_metric(db: &Database, timestamp: &str, hostname: &str) {
+    async fn try_insert_raw_metric(db: &Database, timestamp: &str, hostname: &str) -> sqlx::Result<()> {
         sqlx::query(
             r#"INSERT INTO metrics_history
                (node_id, hostname, timestamp, cpu_usage, memory_usage,
@@ -460,8 +501,15 @@ mod tests {
         .bind(timestamp)
         .execute(&db.pool)
         .await
-        .unwrap();
+        .map(|_| ())
     }
+
+    async fn insert_raw_metric(db: &Database, timestamp: &str, hostname: &str) {
+        try_insert_raw_metric(db, timestamp, hostname)
+            .await
+            .unwrap();
+    }
+
 
     async fn database_bytes(db: &Database) -> u64 {
         let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
@@ -598,6 +646,207 @@ mod tests {
         .await
         .unwrap();
         assert!(newest.starts_with("079-"));
+    }
+
+    #[tokio::test]
+    async fn opening_legacy_database_near_limit_can_add_time_index() {
+        const LIMIT: u64 = 256 * 1024;
+        const MAX_LARGE_ROWS: usize = 128;
+        const MAX_TINY_ROWS: usize = 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-near-limit.db");
+        let path_str = path.to_str().unwrap();
+        let db = Database::new_with_max_size(path_str, LIMIT)
+            .await
+            .unwrap();
+
+        sqlx::query("DROP INDEX idx_metrics_time")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("VACUUM").execute(&db.pool).await.unwrap();
+
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let page_size = u64::try_from(page_size).unwrap();
+        assert!(page_size > 0, "SQLite returned a zero page size");
+        let max_pages = LIMIT / page_size;
+        assert!(max_pages > 0, "database limit must include a SQLite page");
+        let applied_max_pages: i64 = sqlx::query_scalar(&format!(
+            "PRAGMA max_page_count = {max_pages}"
+        ))
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(u64::try_from(applied_max_pages).unwrap(), max_pages);
+
+        let mut page_count: u64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        for index in 0..MAX_LARGE_ROWS {
+            if page_count >= max_pages {
+                break;
+            }
+
+            match try_insert_raw_metric(
+                &db,
+                &Utc.timestamp_opt(index as i64, 0).unwrap().to_rfc3339(),
+                &format!("legacy-{index:03}-{}", "x".repeat(8 * 1024)),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    assert!(
+                        is_database_full(&error),
+                        "large legacy setup insert failed unexpectedly: {error}"
+                    );
+                    break;
+                }
+            }
+            page_count = sqlx::query_scalar("PRAGMA page_count")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        for index in 0..MAX_TINY_ROWS {
+            if page_count >= max_pages {
+                break;
+            }
+
+            match try_insert_raw_metric(
+                &db,
+                &Utc.timestamp_opt(1_000_000 + index as i64, 0)
+                    .unwrap()
+                    .to_rfc3339(),
+                &format!("tiny-{index:04}"),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    assert!(
+                        is_database_full(&error),
+                        "tiny legacy setup insert failed unexpectedly: {error}"
+                    );
+                    break;
+                }
+            }
+            page_count = sqlx::query_scalar("PRAGMA page_count")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        let freelist_count: u64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let file_bytes = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(page_count, max_pages, "legacy setup did not reach exact cap");
+        assert_eq!(freelist_count, 0, "legacy setup left free pages");
+        assert_eq!(file_bytes, LIMIT, "legacy setup file length must equal cap");
+
+        db.pool.close().await;
+        let reopened = Database::new_with_max_size(path_str, LIMIT)
+            .await
+            .expect("legacy database at the cap should migrate successfully");
+        let time_index: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_metrics_time'",
+        )
+        .fetch_optional(&reopened.pool)
+        .await
+        .unwrap();
+        assert_eq!(time_index.as_deref(), Some("idx_metrics_time"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_metric_writes_preserve_the_latest_timestamp() {
+        const LIMIT: u64 = 256 * 1024;
+        const TARGET_MARGIN: u64 = 32 * 1024;
+        const MAX_PREFILL_ROWS: usize = 128;
+        const WRITER_COUNT: usize = 64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent-writes.db");
+        let db = Database::new_with_max_size(path.to_str().unwrap(), LIMIT)
+            .await
+            .unwrap();
+
+        let mut prefill_rows = 0_usize;
+        let mut prefill_bytes = database_bytes(&db).await;
+        while prefill_rows < MAX_PREFILL_ROWS && prefill_bytes <= LIMIT - TARGET_MARGIN {
+            let timestamp = Utc
+                .timestamp_opt(prefill_rows as i64, 0)
+                .unwrap()
+                .to_rfc3339();
+            insert_raw_metric(
+                &db,
+                &timestamp,
+                &format!("prefill-{prefill_rows:03}-{}", "p".repeat(8 * 1024)),
+            )
+            .await;
+            prefill_rows += 1;
+            prefill_bytes = database_bytes(&db).await;
+        }
+        assert!(prefill_rows > 0, "bounded prefill inserted no metric rows");
+        assert!(
+            prefill_bytes > LIMIT - TARGET_MARGIN,
+            "bounded prefill reached only {prefill_bytes} page bytes; target is {}",
+            LIMIT - TARGET_MARGIN
+        );
+        assert!(
+            prefill_bytes <= LIMIT,
+            "prefill page bytes {prefill_bytes} exceed limit {LIMIT}"
+        );
+
+        let db = Arc::new(db);
+        let node_id = uuid::Uuid::new_v4();
+        // Scheduling is intentionally uncontrolled; enough ordered writers make this a
+        // bounded stress regression for interleaved eviction and retry operations.
+        let mut writers = Vec::with_capacity(WRITER_COUNT);
+        for index in 0..WRITER_COUNT {
+            let db = Arc::clone(&db);
+            let metrics = metrics_at(
+                Utc.timestamp_opt(1_000_000 + index as i64, 0).unwrap(),
+                8 * 1024,
+            );
+            writers.push(tokio::spawn(async move {
+                db.store_metrics(&node_id, &metrics).await
+            }));
+        }
+
+        let mut join_results = Vec::with_capacity(WRITER_COUNT);
+        for writer in writers {
+            join_results.push(writer.await);
+        }
+        for (index, result) in join_results.into_iter().enumerate() {
+            let result = result.expect("metric writer task panicked");
+            result.unwrap_or_else(|error| panic!("metric writer {index} failed: {error:#}"));
+        }
+
+        let expected_latest = Utc
+            .timestamp_opt(1_000_000 + WRITER_COUNT as i64 - 1, 0)
+            .unwrap()
+            .to_rfc3339();
+        let latest_timestamp: String = sqlx::query_scalar(
+            "SELECT timestamp FROM metrics_history ORDER BY timestamp DESC, id DESC LIMIT 1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(latest_timestamp, expected_latest);
+
+        let final_main_file_bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            final_main_file_bytes <= LIMIT,
+            "main database file uses {final_main_file_bytes} bytes; limit is {LIMIT}"
+        );
     }
 
     #[tokio::test]
