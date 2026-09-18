@@ -1,6 +1,6 @@
 # 历史记录 500 MiB 上限实现计划
 
-> **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [ ]`）语法来跟踪进度。
+> **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [x]`）语法来跟踪进度。
 
 **目标：** 将 SQLite 主数据库限制在 500 MiB，满容量时淘汰全局最旧指标并保留最新指标。
 
@@ -24,7 +24,7 @@
 - 修改：`src/storage.rs:1-191`
 - 测试：`src/storage.rs` 文件末尾新增 `tests` 模块
 
-- [ ] **步骤 1：编写失败的淘汰顺序测试**
+- [x] **步骤 1：编写失败的淘汰顺序测试**
 
 在 `src/storage.rs` 末尾加入测试模块。测试直接插入最小合法行，使断言只关注全局时间顺序：
 
@@ -83,7 +83,7 @@ mod tests {
 }
 ```
 
-- [ ] **步骤 2：运行测试并确认失败**
+- [x] **步骤 2：运行测试并确认失败**
 
 运行：
 
@@ -93,7 +93,7 @@ cargo test storage::tests::delete_oldest_metrics_orders_by_timestamp_then_id -- 
 
 预期：编译失败，指出 `delete_oldest_metrics_batch` 尚不存在。
 
-- [ ] **步骤 3：实现最小淘汰原语和时间索引**
+- [x] **步骤 3：实现最小淘汰原语和时间索引**
 
 在 `src/storage.rs` 顶部加入批量大小常量：
 
@@ -129,7 +129,7 @@ async fn delete_oldest_metrics_batch(&self, limit: i64) -> Result<u64> {
 }
 ```
 
-- [ ] **步骤 4：运行淘汰测试并确认通过**
+- [x] **步骤 4：运行淘汰测试并确认通过**
 
 运行：
 
@@ -139,7 +139,7 @@ cargo test storage::tests::delete_oldest_metrics_orders_by_timestamp_then_id -- 
 
 预期：PASS。
 
-- [ ] **步骤 5：提交淘汰原语**
+- [x] **步骤 5：提交淘汰原语**
 
 ```bash
 git add src/storage.rs
@@ -152,7 +152,7 @@ git commit -m "feat: 增加最旧指标淘汰原语"
 - 修改：`src/storage.rs`
 - 测试：`src/storage.rs::tests`
 
-- [ ] **步骤 1：编写失败的启动收缩测试**
+- [x] **步骤 1：编写失败的启动收缩测试**
 
 在测试模块加入页大小帮助函数和测试。先用 4 MiB 上限创建较大数据库，关闭后用 256 KiB 上限重新打开：
 
@@ -196,7 +196,7 @@ async fn opening_oversized_database_evicts_oldest_and_shrinks_file() {
 }
 ```
 
-- [ ] **步骤 2：运行测试并确认失败**
+- [x] **步骤 2：运行测试并确认失败**
 
 运行：
 
@@ -206,7 +206,7 @@ cargo test storage::tests::opening_oversized_database_evicts_oldest_and_shrinks_
 
 预期：编译失败，指出 `Database::new_with_max_size` 尚不存在。
 
-- [ ] **步骤 3：实现连接级上限与启动收缩**
+- [x] **步骤 3：实现连接级上限与启动收缩**
 
 给 `Database` 保存测试/生产共用的字节上限，并导入 `anyhow::ensure`、`sqlx::SqliteConnection`、`tracing::warn`：
 
@@ -336,7 +336,7 @@ async fn enforce_startup_size_limit(&self) -> Result<()> {
 
 `SqlitePoolOptions::connect` 在 `Database::new_with_max_size` 返回前只建立初始化连接；该连接在收缩后显式重设上限，后续连接通过 `after_connect` 获得相同上限，因此无需关闭和重建连接池。
 
-- [ ] **步骤 4：运行启动收缩测试与淘汰测试**
+- [x] **步骤 4：运行启动收缩测试与淘汰测试**
 
 运行：
 
@@ -346,7 +346,7 @@ cargo test storage::tests
 
 预期：两个现有 storage 测试均 PASS。
 
-- [ ] **步骤 5：提交启动容量治理**
+- [x] **步骤 5：提交启动容量治理**
 
 ```bash
 git add src/storage.rs
@@ -359,7 +359,7 @@ git commit -m "feat: 限制历史数据库容量"
 - 修改：`src/storage.rs:83-108`
 - 测试：`src/storage.rs::tests`
 
-- [ ] **步骤 1：编写失败的满容量行为测试**
+- [x] **步骤 1：编写失败的满容量行为测试**
 
 加入真实 `SystemMetrics` 夹具和测试：
 
@@ -416,7 +416,7 @@ async fn full_database_evicts_oldest_and_keeps_latest_metric() {
 }
 ```
 
-- [ ] **步骤 2：运行测试并确认失败**
+- [x] **步骤 2：运行测试并确认失败**
 
 运行：
 
@@ -426,7 +426,7 @@ cargo test storage::tests::full_database_evicts_oldest_and_keeps_latest_metric -
 
 预期：FAIL，现有 `store_metrics` 返回 SQLite `database or disk is full`。
 
-- [ ] **步骤 3：实现仅针对 SQLITE_FULL 的淘汰重试**
+- [x] **步骤 3：实现仅针对 SQLITE_FULL 的淘汰重试**
 
 加入错误分类函数：
 
@@ -465,7 +465,7 @@ loop {
 
 不匹配错误消息文本，不对锁冲突或损坏执行删除。
 
-- [ ] **步骤 4：运行所有 storage 测试**
+- [x] **步骤 4：运行所有 storage 测试**
 
 运行：
 
@@ -475,7 +475,7 @@ cargo test storage::tests
 
 预期：全部 PASS，无 warning。
 
-- [ ] **步骤 5：提交满容量重试**
+- [x] **步骤 5：提交满容量重试**
 
 ```bash
 git add src/storage.rs
@@ -489,7 +489,7 @@ git commit -m "feat: 满容量时保留最新指标"
 - 修改：`config.full.example.toml:37-39`
 - 修改：`config.node.example.toml:34-36`
 
-- [ ] **步骤 1：编写失败的时间清理回归测试**
+- [x] **步骤 1：编写失败的时间清理回归测试**
 
 为了避免依赖真实当前时间边界，插入一条 48 小时前和一条当前记录：
 
@@ -511,7 +511,7 @@ async fn cleanup_old_metrics_only_removes_expired_rows() {
 
 先临时改变断言期望为 2，运行确认测试能捕获错误，再恢复为 1；这是现有行为的特征测试，不改生产清理逻辑。
 
-- [ ] **步骤 2：运行时间清理测试**
+- [x] **步骤 2：运行时间清理测试**
 
 运行：
 
@@ -521,7 +521,7 @@ cargo test storage::tests::cleanup_old_metrics_only_removes_expired_rows -- --ex
 
 预期：恢复正确断言后 PASS。
 
-- [ ] **步骤 3：更新发布配置说明**
+- [x] **步骤 3：更新发布配置说明**
 
 `config.full.example.toml`：
 
@@ -539,7 +539,7 @@ db_path = "os-watcher.db"       # SQLite 数据库文件路径
 retention_hours = 12             # 若存储则保留 12 小时；主数据库同时受 500 MiB 固定上限约束
 ```
 
-- [ ] **步骤 4：运行格式化和针对性测试**
+- [x] **步骤 4：运行格式化和针对性测试**
 
 运行：
 
@@ -550,7 +550,7 @@ cargo test storage::tests
 
 预期：格式检查成功，所有 storage 测试 PASS。
 
-- [ ] **步骤 5：提交回归测试和配置说明**
+- [x] **步骤 5：提交回归测试和配置说明**
 
 ```bash
 git add src/storage.rs config.full.example.toml config.node.example.toml
@@ -562,7 +562,7 @@ git commit -m "test: 覆盖历史记录容量治理"
 **文件：**
 - 不新增文件
 
-- [ ] **步骤 1：运行完整 Rust 测试套件**
+- [x] **步骤 1：运行完整 Rust 测试套件**
 
 ```bash
 cargo test
@@ -570,7 +570,7 @@ cargo test
 
 预期：全部测试 PASS，无编译错误。
 
-- [ ] **步骤 2：运行发布构建检查**
+- [x] **步骤 2：运行发布构建检查**
 
 ```bash
 cargo check --release
@@ -578,7 +578,7 @@ cargo check --release
 
 预期：成功完成，无 error。
 
-- [ ] **步骤 3：核对行为证据**
+- [x] **步骤 3：核对行为证据**
 
 从 `full_database_evicts_oldest_and_keeps_latest_metric` 输出确认：
 

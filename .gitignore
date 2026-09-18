@@ -5,3 +5,9 @@ target
 .worktrees/
 settings.json
 settings*.json
+.claude
+.claude_bak
+.claude-bak
+.agent
+superpowers
+dist

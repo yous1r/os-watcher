@@ -33,7 +33,7 @@ enabled = false
 
 [storage]
 db_path = "os-watcher.db"       # SQLite 数据库文件路径
-retention_hours = 12             # node 节点不需要存库；若存储，只保留 12 小时
+retention_hours = 12             # node 节点不需要存库；若存储，只保留 12 小时；主数据库同时受 500 MiB 固定上限约束
 
 [tui]
 refresh_ms = 1000               # 终端面板刷新间隔（毫秒），启动时加 --tui 使用
