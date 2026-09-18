@@ -28,15 +28,37 @@ bind_addr = "0.0.0.0"           # API 监听地址
 enabled = true                  # 面板依赖 API，必须开启
 
 # ---- Web 面板 ----
-# 注意：面板与 API 监听同一端口，且当前没有内置鉴权。
-# 暴露到公网前请在前面加反向代理并配置访问控制，或把 api.bind_addr 收窄到内网地址。
+# 注意：面板与 API 监听同一端口。监控视图（概览/节点详情/告警）访客可读，
+# 管理动作（自升级、远程部署、推送渠道）需要管理员登录，见下方 [auth]。
+# 无论是否设置口令，都应仅在可信网络内暴露。
 [web]
 enabled = true                  # 开启后无需命令行 --web
 dir = "web-dist"                # 发布包内前端静态资源目录
 
+# ---- 管理鉴权 ----
+# 监控页（概览/节点详情/告警）访客只读，无需登录。
+# 管理动作（自升级、远程部署、推送渠道管理）需要登录；未设置 password 时管理接口一律拒绝并提示。
+[auth]
+enabled = true                  # 置为 false 则所有管理动作对访客开放（仅限可信网络）
+password = ""                   # 管理口令，请务必修改
+
+# ---- 消息推送 ----
+# 推送渠道在面板「推送设置」页维护，落库保存；此处只管开关、默认服务地址与出网参数。
+# 渠道支持 Bark：填入设备 Key 即可，服务地址留空则用下方 server_url。
+# 自建 bark-server 把 server_url 改成自己的地址（可带路径前缀，如 https://example.com/bark）
+# 即可，无需在面板里逐个填写。若 Bark App 中开启了内容加密，需在面板里选择同样的算法
+# （AES128/AES192/AES256）、模式（CBC/GCM/ECB）、密钥与 IV，二者完全一致才能解密。
+# GCM 仅支持 AES128/AES256。
+[notify]
+enabled = true                  # 置为 false 则不发送任何推送（渠道配置保留）
+server_url = "https://api.day.app" # 渠道未单独填写时使用的 Bark 服务地址
+timeout_secs = 10
+# proxy = "http://127.0.0.1:7890" # 可选；也与 upgrade.proxy 一样支持 HTTP_PROXY/HTTPS_PROXY 环境变量
+
 [storage]
 db_path = "os-watcher.db"       # SQLite 数据库文件路径
 retention_hours = 12             # 仅 web 节点存库，保留 12 小时；主数据库同时受 500 MiB 固定上限约束
+alert_history_minutes = 10       # 面板「最近恢复」保留时长（分钟），过期自动删除；0 表示一解除就删除
 
 [tui]
 refresh_ms = 1000               # 终端面板刷新间隔（毫秒）
@@ -50,8 +72,8 @@ service_name = "os-watcher"     # Linux systemd / Windows 服务名
 # proxy = "http://127.0.0.1:7890" # 可选；也支持 HTTP_PROXY/HTTPS_PROXY 环境变量
 
 # ---- 远程节点部署 ----
-# 警告：面板与 API 当前没有鉴权，远程部署端点会接收 SSH 凭据并执行提权命令。
-# 必须仅在可信网络内暴露；不使用时请设置 enabled = false。
+# 警告：远程部署端点会接收 SSH 凭据并执行提权命令，现需管理员登录（见 [auth]）。
+# 仍应仅在可信网络内暴露；不使用时请设置 enabled = false。
 [deploy]
 enabled = true
 default_install_dir = "/opt/os-watcher"
@@ -59,6 +81,7 @@ connect_timeout_secs = 20
 max_attempts = 3
 
 # ---- 告警规则 ----
+# message 可选，支持占位符：{hostname} {metric} {target} {value:.1} {threshold} {unit} {operator}
 [[alerts]]
 name = "high_cpu"
 metric = "cpu"                  # cpu / memory / swap / disk / load1 / load5 / load15

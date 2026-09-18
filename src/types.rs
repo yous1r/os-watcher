@@ -293,11 +293,56 @@ pub struct NodeSnapshot {
 }
 
 /// Alert severity levels
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum AlertSeverity {
     Info,
     Warning,
     Critical,
+}
+
+impl AlertSeverity {
+    /// Ordering rank, used to filter notifications by channel minimum severity.
+    pub fn rank(self) -> u8 {
+        match self {
+            AlertSeverity::Info => 0,
+            AlertSeverity::Warning => 1,
+            AlertSeverity::Critical => 2,
+        }
+    }
+
+    /// Chinese display name shared by the panel and push notifications.
+    pub fn label(self) -> &'static str {
+        match self {
+            AlertSeverity::Info => "提示",
+            AlertSeverity::Warning => "警告",
+            AlertSeverity::Critical => "严重",
+        }
+    }
+}
+
+/// Why an alert was resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertResolveReason {
+    /// The rule was re-evaluated and the condition no longer holds.
+    ConditionCleared,
+    /// The owning node went offline (or stopped reporting) while the alert was active.
+    NodeOffline,
+    /// The owning node disappeared from the mesh (e.g. restarted with a new id).
+    NodeRemoved,
+    /// The rule's target device/metric is no longer present in the report.
+    MetricUnavailable,
+}
+
+impl AlertResolveReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            AlertResolveReason::ConditionCleared => "条件已恢复",
+            AlertResolveReason::NodeOffline => "节点离线",
+            AlertResolveReason::NodeRemoved => "节点已移除",
+            AlertResolveReason::MetricUnavailable => "指标不可用",
+        }
+    }
 }
 
 /// An alert condition that has been triggered
@@ -305,13 +350,150 @@ pub enum AlertSeverity {
 pub struct Alert {
     pub id: Uuid,
     pub node_id: NodeId,
+    /// Hostname of the node the alert belongs to, captured when it triggered.
+    pub hostname: String,
     pub rule_name: String,
+    /// Metric name from the rule (cpu/memory/disk/...).
+    pub metric: String,
+    /// Device or mount point the rule watched, when it targeted one.
+    pub target: Option<String>,
+    /// Rule operator as written in the config (gt/gte/lt/lte/eq).
+    pub operator: String,
     pub severity: AlertSeverity,
     pub message: String,
     pub triggered_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
+    /// Set together with `resolved_at`.
+    pub resolved_reason: Option<AlertResolveReason>,
+    /// Observed value at trigger time (not refreshed afterwards).
     pub value: f64,
     pub threshold: f64,
+}
+
+/// AES key size used to encrypt Bark push payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BarkAlgorithm {
+    Aes128,
+    Aes192,
+    Aes256,
+}
+
+impl BarkAlgorithm {
+    /// Key length in bytes, mirroring the Bark app's `AESCryptoModel`.
+    pub fn key_len(self) -> usize {
+        match self {
+            BarkAlgorithm::Aes128 => 16,
+            BarkAlgorithm::Aes192 => 24,
+            BarkAlgorithm::Aes256 => 32,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BarkAlgorithm::Aes128 => "AES128",
+            BarkAlgorithm::Aes192 => "AES192",
+            BarkAlgorithm::Aes256 => "AES256",
+        }
+    }
+}
+
+/// Cipher mode used to encrypt Bark push payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BarkMode {
+    Cbc,
+    Ecb,
+    Gcm,
+}
+
+impl BarkMode {
+    /// Required IV length in bytes; `None` means the mode takes no IV.
+    pub fn iv_len(self) -> Option<usize> {
+        match self {
+            BarkMode::Cbc => Some(16),
+            BarkMode::Gcm => Some(12),
+            BarkMode::Ecb => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BarkMode::Cbc => "CBC",
+            BarkMode::Ecb => "ECB",
+            BarkMode::Gcm => "GCM",
+        }
+    }
+}
+
+/// Content encryption settings for a Bark channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BarkEncryption {
+    pub algorithm: BarkAlgorithm,
+    pub mode: BarkMode,
+    /// Raw key bytes as literal characters (not hex-encoded).
+    pub key: String,
+    /// Required for CBC/GCM, must be absent for ECB.
+    pub iv: Option<String>,
+}
+
+/// Bark push channel settings (server root URL + device key + optional encryption).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BarkChannelConfig {
+    /// Bark server root, e.g. `https://api.day.app` or a self-hosted instance.
+    pub server_url: String,
+    pub device_key: String,
+    pub encryption: Option<BarkEncryption>,
+}
+
+/// Kind-specific channel settings. Internally tagged so new kinds (webhook,
+/// ntfy, ...) are additive and need no schema migration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ChannelConfig {
+    Bark(BarkChannelConfig),
+}
+
+/// Minimum alert severity a channel accepts. Separate type from
+/// `AlertSeverity`: this one is configuration (lowercase JSON, persisted in
+/// SQLite) while `AlertSeverity` is part of the alert record shown to clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifySeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+impl NotifySeverity {
+    pub fn rank(self) -> u8 {
+        match self {
+            NotifySeverity::Info => 0,
+            NotifySeverity::Warning => 1,
+            NotifySeverity::Critical => 2,
+        }
+    }
+
+    /// Whether an alert of `severity` meets this channel's bar.
+    pub fn allows(self, severity: AlertSeverity) -> bool {
+        self.rank() <= severity.rank()
+    }
+}
+
+/// A configured push channel, as stored in SQLite and served to the panel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotifyChannel {
+    pub id: Uuid,
+    pub name: String,
+    pub enabled: bool,
+    pub min_severity: NotifySeverity,
+    pub config: ChannelConfig,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Last successful send, or `None` if never delivered.
+    pub last_sent_at: Option<DateTime<Utc>>,
+    /// Error text of the most recent failed send; cleared on success.
+    pub last_error: Option<String>,
 }
 
 /// Gossip message types for inter-node communication

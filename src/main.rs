@@ -1,11 +1,14 @@
 mod alerts;
 mod api;
+mod auth;
 mod collector;
 mod config;
 mod deploy;
 mod disk_health;
 mod diskstats;
 mod gossip;
+mod http;
+mod notify;
 mod smart;
 mod state;
 mod storage;
@@ -266,17 +269,35 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
     let upgrade_manager = UpgradeManager::new(cfg.upgrade.clone(), env!("CARGO_PKG_VERSION"))?;
     upgrade_manager.spawn_version_check_loop();
 
+    // Push notifications and admin sessions. Channels live in the database, so
+    // the service only needs the global switch and egress settings.
+    let notifier = notify::NotificationService::new(Arc::clone(&db), &cfg.notify)?;
+    let auth_manager = auth::AuthManager::new(&cfg.auth);
+
+    // Restore alerts that were still active when the process last stopped, so a
+    // restart (including a self-upgrade) does not silently drop them.
+    let restored_alerts = db.load_active_alerts().await.unwrap_or_default();
+    if !restored_alerts.is_empty() {
+        info!(
+            "Restored {} active alert(s) from database",
+            restored_alerts.len()
+        );
+        state.write().await.restore_alerts(restored_alerts);
+    }
+
     // Clone for tasks
     let cfg = Arc::new(cfg);
     let alerts_config = cfg.alerts.clone();
     let collect_interval = cfg.metrics.collect_interval_secs;
     let top_n = cfg.metrics.top_processes_count;
     let retention_hours = cfg.storage.retention_hours;
+    let alert_history_minutes = cfg.storage.alert_history_minutes;
     let tui_refresh_ms = cfg.tui.refresh_ms;
 
     // Task 1: Metrics collection loop
     let collect_state = Arc::clone(&state);
     let collect_db = Arc::clone(&db);
+    let collect_notifier = notifier.clone();
     tokio::spawn(async move {
         let mut collector = MetricsCollector::new();
         let mut interval =
@@ -299,7 +320,14 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
             }
 
             // Evaluate alert rules
-            alerts::evaluate_alerts(&collect_state, &alerts_config).await;
+            alerts::evaluate_alerts(
+                &collect_state,
+                &alerts_config,
+                &collect_db,
+                &collect_notifier,
+                alert_history_minutes,
+            )
+            .await;
         }
     });
 
@@ -323,7 +351,10 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
         let api_upgrade_config = cfg.upgrade.clone();
         let api_deploy = cfg.deploy.clone();
         let api_gossip_addr = gossip_addr.clone();
-        if let Some(ref dir) = api_web_dir {
+        let api_db = Arc::clone(&db);
+        let api_notify = notifier.clone();
+        let api_auth = auth_manager.clone();
+        if let Some(dir) = &api_web_dir {
             info!("  Web dashboard: http://{} (serving '{}')", api_addr, dir);
         }
         tokio::spawn(async move {
@@ -333,6 +364,10 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
                 api_upgrade_config,
                 api_deploy,
                 api_gossip_addr,
+                api_db,
+                api_notify,
+                api_auth,
+                alert_history_minutes,
                 &api_bind,
                 api_port,
                 api_web_dir,

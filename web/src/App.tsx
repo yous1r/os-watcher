@@ -1,13 +1,23 @@
-import { createSignal, createResource, onCleanup, Show } from "solid-js";
+import { createSignal, createResource, onCleanup, onMount, Show } from "solid-js";
 import { Tabs } from "@ark-ui/solid/tabs";
-import { fetchSnapshots, fetchAlerts, fetchVersion, API_BASE } from "./api";
+import {
+  fetchSnapshots,
+  fetchAlerts,
+  fetchAlertsHistory,
+  fetchAlertRetention,
+  fetchVersion,
+  API_BASE,
+} from "./api";
 import type { NodeSnapshot, Alert, VersionInfo } from "./types";
 import { formatTime } from "./format";
 import { Overview } from "./views/Overview";
 import { NodeDetail } from "./views/NodeDetail";
 import { Alerts } from "./views/Alerts";
+import { NotifySettings } from "./views/NotifySettings";
 import { AddNodeDialog } from "./views/AddNodeDialog";
+import { LoginDialog } from "./views/LoginDialog";
 import { deployStore } from "./deployStore";
+import { authStore } from "./authStore";
 
 const REFRESH_MS = 3000;
 
@@ -47,6 +57,31 @@ export default function App() {
     { initialValue: [] }
   );
 
+  const [alertHistory] = createResource<Alert[], number>(
+    tick,
+    async () => {
+      try {
+        return await fetchAlertsHistory();
+      } catch {
+        return [];
+      }
+    },
+    { initialValue: [] }
+  );
+
+  // 保留时长由服务端配置决定，面板只负责显示。
+  const [alertRetention] = createResource<number, number>(
+    tick,
+    async () => {
+      try {
+        return (await fetchAlertRetention()).history_minutes;
+      } catch {
+        return 10;
+      }
+    },
+    { initialValue: 10 }
+  );
+
   const [versionInfo, { refetch: refetchVersion }] = createResource<
     VersionInfo | null,
     number
@@ -65,8 +100,14 @@ export default function App() {
   const timer = setInterval(() => setTick((t) => t + 1), REFRESH_MS);
   onCleanup(() => clearInterval(timer));
 
+  onMount(() => void authStore.refresh());
+
   const nodeCount = () => snapshots().length;
   const alertCount = () => alerts().length;
+  const authRequired = authStore.authRequired;
+  const authenticated = authStore.authenticated;
+
+  const handleLogout = () => void authStore.logout();
 
   return (
     <div class="app">
@@ -100,16 +141,47 @@ export default function App() {
           </span>
           <span class="sep">|</span>
           <span>{lastUpdate()}</span>
+          <Show when={authRequired()}>
+            <span class="sep">|</span>
+            <span class="auth-actions">
+              <Show
+                when={authenticated()}
+                fallback={
+                  <button
+                    type="button"
+                    class="auth-chip auth-chip-guest"
+                    onClick={authStore.openLogin}
+                  >
+                    访客 · 管理登录
+                  </button>
+                }
+              >
+                <span class="auth-chip auth-chip-admin">管理员</span>
+                <button
+                  type="button"
+                  class="auth-chip auth-chip-logout"
+                  onClick={handleLogout}
+                >
+                  退出
+                </button>
+              </Show>
+            </span>
+          </Show>
           <button
             type="button"
             class="add-node-btn"
             classList={{ deploying: deployStore.isRunning() }}
             title={
-              deployStore.isRunning()
-                ? "部署进行中，点击查看进度"
-                : "添加节点"
+              !authStore.canManage()
+                ? "需要管理员登录"
+                : deployStore.isRunning()
+                  ? "部署进行中，点击查看进度"
+                  : "添加节点"
             }
-            onClick={() => setAddNodeOpen(true)}
+            onClick={() => {
+              if (!authStore.allowed()) return;
+              setAddNodeOpen(true);
+            }}
           >
             {deployStore.isRunning()
               ? "部署中…"
@@ -134,6 +206,9 @@ export default function App() {
               <span class="tab-badge">{alertCount()}</span>
             </Show>
           </Tabs.Trigger>
+          <Tabs.Trigger value="notify" class="tab">
+            推送设置
+          </Tabs.Trigger>
           <Tabs.Indicator class="tab-indicator" />
         </Tabs.List>
 
@@ -148,7 +223,14 @@ export default function App() {
           <NodeDetail snapshots={snapshots()} />
         </Tabs.Content>
         <Tabs.Content value="alerts" class="tab-content">
-          <Alerts alerts={alerts()} />
+          <Alerts
+            alerts={alerts()}
+            history={alertHistory()}
+            historyMinutes={alertRetention()}
+          />
+        </Tabs.Content>
+        <Tabs.Content value="notify" class="tab-content">
+          <NotifySettings />
         </Tabs.Content>
       </Tabs.Root>
 
@@ -163,6 +245,10 @@ export default function App() {
           onClose={() => setAddNodeOpen(false)}
           onDeployed={() => setTick((t) => t + 1)}
         />
+      </Show>
+
+      <Show when={authStore.loginOpen()}>
+        <LoginDialog onClose={authStore.closeLogin} />
       </Show>
     </div>
   );

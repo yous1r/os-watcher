@@ -1,5 +1,6 @@
 import { createSignal, For, onCleanup, Show } from "solid-js";
-import { fetchNodeUpgradeStatus, triggerNodeUpgrade } from "../api";
+import { ApiError, fetchNodeUpgradeStatus, triggerNodeUpgrade } from "../api";
+import { authStore } from "../authStore";
 import type { NodeSnapshot, PackageKind, UpgradeStatus, VersionInfo } from "../types";
 import { formatUptime, usageTone, maxDiskUsage } from "../format";
 
@@ -152,6 +153,11 @@ export function Overview(props: {
       }
       props.onUpgradeRequested?.();
     } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        authStore.handleUnauthorized();
+        setTarget(null);
+        return;
+      }
       setResultMessage(err instanceof Error ? err.message : "升级请求失败");
     } finally {
       setUpgradingId(null);
@@ -197,9 +203,9 @@ export function Overview(props: {
                           : `节点 ${snap.info.hostname} 状态`
                       }
                       onClick={() => {
-                        if (updateAvailable(snap) && online) {
-                          openUpgradeDialog(snap);
-                        }
+                        if (!updateAvailable(snap) || !online) return;
+                        if (!authStore.allowed()) return;
+                        openUpgradeDialog(snap);
                       }}
                     />
                     <span class="node-name">{snap.info.hostname}</span>

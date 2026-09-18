@@ -14,6 +14,8 @@
   --ok: #3fb950;
   --warn: #d29922;
   --crit: #f85149;
+  /* `--danger` 是 --crit 的语义别名，供表单校验与错误提示复用。 */
+  --danger: #f85149;
   --radius: 12px;
   --radius-sm: 8px;
   --shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
@@ -873,6 +875,16 @@ body {
   margin: 0;
 }
 
+.panel-head h3 small {
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+
 .sort-tabs {
   display: flex;
   gap: 2px;
@@ -1313,6 +1325,7 @@ body {
 }
 
 .form-field input,
+.form-field select,
 .form-field textarea {
   width: 100%;
   border: 1px solid var(--border);
@@ -1324,6 +1337,36 @@ body {
   font-size: 13px;
 }
 
+.form-field select {
+  cursor: pointer;
+}
+
+.form-field small {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+
+/* 复选框行：与其它字段同构，但标签在控件右侧。 */
+.form-field-inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.form-field-inline input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.form-field-inline > span {
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+
 .form-field input:focus,
 .form-field textarea:focus {
   outline: none;
@@ -1331,6 +1374,7 @@ body {
 }
 
 .form-field input:focus-visible,
+.form-field select:focus-visible,
 .form-field textarea:focus-visible,
 .package-toggle button:focus-visible,
 .advanced-toggle:focus-visible,
@@ -1523,6 +1567,275 @@ body {
 
 .deploy-log-line.stderr {
   color: var(--crit);
+}
+
+/* ---------- 管理鉴权（会话状态与登录） ---------- */
+.auth-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.auth-chip {
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 4px 10px;
+  background: var(--bg-inset);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.auth-chip:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.auth-chip-guest {
+  border-color: var(--border-strong);
+}
+
+.auth-chip-admin {
+  border-color: rgba(63, 185, 80, 0.4);
+  background: rgba(63, 185, 80, 0.12);
+  color: var(--ok);
+  cursor: default;
+}
+
+.auth-chip-admin:hover {
+  border-color: rgba(63, 185, 80, 0.4);
+  color: var(--ok);
+}
+
+.auth-chip-logout {
+  padding: 4px 9px;
+}
+
+.login-dialog {
+  width: min(420px, 100%);
+}
+
+.login-hint {
+  margin: 0 0 14px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+
+/* ---------- 推送渠道设置 ---------- */
+.notify-hint {
+  margin: 0 0 14px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+
+.notice-warn {
+  margin: 0 0 14px;
+  padding: 9px 10px;
+  border: 1px solid rgba(210, 153, 34, 0.35);
+  border-radius: 6px;
+  background: rgba(210, 153, 34, 0.09);
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.notify-list {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+
+.notify-item {
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: var(--radius-sm);
+  padding: 13px 16px;
+}
+
+.notify-item.channel-disabled {
+  border-left-color: var(--text-faint);
+  opacity: 0.72;
+}
+
+.channel-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.channel-kind {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.channel-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.channel-tag {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-faint);
+}
+
+.channel-sev {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.channel-detail {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
+.channel-detail .sep {
+  opacity: 0.3;
+}
+
+.channel-status {
+  margin-top: 7px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.channel-status.err {
+  color: var(--crit);
+}
+
+.channel-actions {
+  margin-top: 11px;
+  display: flex;
+  gap: 8px;
+}
+
+.channel-actions .btn-secondary {
+  min-width: 0;
+  padding: 6px 12px;
+  font-size: 12.5px;
+}
+
+.channel-test-result {
+  margin-top: 9px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.channel-test-result.ok {
+  border: 1px solid rgba(63, 185, 80, 0.35);
+  background: rgba(63, 185, 80, 0.1);
+  color: var(--ok);
+}
+
+.channel-test-result.err {
+  border: 1px solid rgba(248, 81, 73, 0.35);
+  background: rgba(248, 81, 73, 0.1);
+  color: var(--crit);
+}
+
+.channel-dialog {
+  width: min(560px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+}
+
+.encryption-fields {
+  padding: 12px 12px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(13, 18, 25, 0.6);
+  margin-bottom: 14px;
+}
+
+/* ---------- 告警归属与恢复历史 ---------- */
+.alert-host {
+  color: var(--accent);
+}
+
+.alert-rule-name::before {
+  content: "·";
+  margin: 0 6px;
+  color: var(--text-faint);
+}
+
+.alert-duration {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.history-panel {
+  margin-top: 20px;
+}
+
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.history-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-inset);
+  font-size: 12.5px;
+}
+
+.history-host {
+  font-weight: 600;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.history-msg {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-dim);
+  word-break: break-word;
+}
+
+.history-meta {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-reason {
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: rgba(63, 185, 80, 0.12);
+  color: var(--ok);
+  font-size: 11.5px;
+}
+
+.history-time {
+  color: var(--text-faint);
 }
 
 @media (prefers-reduced-motion: reduce) {

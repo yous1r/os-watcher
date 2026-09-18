@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// Root configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +30,12 @@ pub struct Config {
     /// Remote node deployment settings
     #[serde(default)]
     pub deploy: DeployConfig,
+    /// Admin authentication for management endpoints
+    #[serde(default)]
+    pub auth: AuthConfig,
+    /// Outbound push notifications
+    #[serde(default)]
+    pub notify: NotifyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,7 +114,10 @@ pub struct WebConfig {
     /// The `--web` CLI flag turns this on regardless of the config value.
     #[serde(default)]
     pub enabled: bool,
-    /// Directory holding the built frontend assets
+    /// Directory holding the built frontend assets. When it holds no bundle,
+    /// the shipped layouts (`web-dist` in a release bundle, `web/dist` in a
+    /// source checkout) are probed next to the working directory and the
+    /// executable, so one config works in both layouts.
     #[serde(default = "default_web_dir")]
     pub dir: String,
 }
@@ -120,6 +130,11 @@ pub struct StorageConfig {
     /// How long to retain metrics history (hours)
     #[serde(default = "default_retention_hours")]
     pub retention_hours: u64,
+    /// How long resolved alerts stay in the 最近恢复 list and in the
+    /// `alerts_log` table before being deleted (minutes). `0` deletes them as
+    /// soon as they resolve.
+    #[serde(default = "default_alert_history_minutes")]
+    pub alert_history_minutes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +211,66 @@ pub struct DeployConfig {
     pub max_attempts: u32,
 }
 
+/// Admin authentication for management endpoints (upgrade, remote deploy, push channels).
+///
+/// Monitoring endpoints stay readable by guests; only management actions need a
+/// session. An empty password makes every management request fail with an
+/// explicit configuration hint instead of silently allowing access.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// Whether management endpoints require a login session.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Admin password. Empty means management endpoints reject every request.
+    #[serde(default)]
+    pub password: String,
+    /// Session lifetime in hours.
+    #[serde(default = "default_session_ttl_hours")]
+    pub session_ttl_hours: u64,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            password: String::new(),
+            session_ttl_hours: default_session_ttl_hours(),
+        }
+    }
+}
+
+/// Outbound push notification settings.
+///
+/// Channels themselves live in the database and are managed from the panel;
+/// only the global switch and egress parameters are configured here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotifyConfig {
+    /// Master switch; channels survive being switched off.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Bark server root for channels that do not carry their own address. Point
+    /// this at a self-hosted bark-server to avoid retyping it per channel.
+    #[serde(default = "default_notify_server_url")]
+    pub server_url: String,
+    /// Optional proxy URL; HTTP(S)_PROXY environment variables still work.
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// Request timeout in seconds.
+    #[serde(default = "default_notify_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            server_url: default_notify_server_url(),
+            proxy: None,
+            timeout_secs: default_notify_timeout_secs(),
+        }
+    }
+}
+
 /// An alert rule definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertRule {
@@ -258,6 +333,12 @@ fn default_db_path() -> String {
 fn default_retention_hours() -> u64 {
     12
 } // 12 hours
+
+/// Default window for the 最近恢复 list; the panel reads the same value from
+/// `/api/v1/alerts/retention`.
+pub fn default_alert_history_minutes() -> u64 {
+    10
+}
 fn default_tui_refresh_ms() -> u64 {
     1000
 }
@@ -284,6 +365,15 @@ fn default_deploy_connect_timeout() -> u64 {
 }
 fn default_deploy_max_attempts() -> u32 {
     3
+}
+fn default_session_ttl_hours() -> u64 {
+    12
+}
+fn default_notify_timeout_secs() -> u64 {
+    10
+}
+fn default_notify_server_url() -> String {
+    crate::notify::DEFAULT_SERVER_URL.to_string()
 }
 
 impl Default for Config {
@@ -317,6 +407,7 @@ impl Default for Config {
             storage: StorageConfig {
                 db_path: default_db_path(),
                 retention_hours: default_retention_hours(),
+                alert_history_minutes: default_alert_history_minutes(),
             },
             alerts: vec![
                 // Default alert rules
@@ -348,6 +439,8 @@ impl Default for Config {
             },
             upgrade: UpgradeConfig::default(),
             deploy: DeployConfig::default(),
+            auth: AuthConfig::default(),
+            notify: NotifyConfig::default(),
         }
     }
 }
@@ -533,6 +626,68 @@ mod tests {
     fn full_template_defaults_upgrade_package_to_full() {
         let cfg = parse(FULL_CONFIG_TEMPLATE);
         assert_eq!(cfg.upgrade.package, PackageKind::Full);
+    }
+
+    #[test]
+    fn auth_and_notify_defaults_are_loaded_when_section_absent() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [node]
+            [metrics]
+            [network]
+            [api]
+            [storage]
+            "#,
+        )
+        .expect("legacy config without [auth]/[notify] should parse");
+
+        assert!(cfg.auth.enabled, "management endpoints must be protected by default");
+        assert!(cfg.auth.password.is_empty());
+        assert_eq!(cfg.auth.session_ttl_hours, 12);
+        assert!(cfg.notify.enabled);
+        assert!(cfg.notify.proxy.is_none());
+        assert_eq!(cfg.notify.timeout_secs, 10);
+        assert_eq!(cfg.notify.server_url, crate::notify::DEFAULT_SERVER_URL);
+        assert_eq!(
+            cfg.storage.alert_history_minutes,
+            default_alert_history_minutes(),
+            "最近恢复 must default to a 10 minute window"
+        );
+    }
+
+    #[test]
+    fn alert_history_retention_is_configurable() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [node]
+            [metrics]
+            [network]
+            [api]
+            [storage]
+            alert_history_minutes = 30
+            "#,
+        )
+        .expect("config with a retention window should parse");
+        assert_eq!(cfg.storage.alert_history_minutes, 30);
+    }
+
+    #[test]
+    fn a_self_hosted_bark_server_is_loadable_from_the_config() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [node]
+            [metrics]
+            [network]
+            [api]
+            [storage]
+            [notify]
+            enabled = true
+            server_url = "https://bark.example.com/bark/"
+            "#,
+        )
+        .expect("config with a self-hosted server should parse");
+
+        assert_eq!(cfg.notify.server_url, "https://bark.example.com/bark/");
     }
 
     #[test]

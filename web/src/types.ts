@@ -191,16 +191,85 @@ export interface UpgradeRequest {
 
 export type AlertSeverity = "Info" | "Warning" | "Critical";
 
+/** 告警被消除的原因，与后端 `AlertResolveReason` 的 snake_case 表示一致。 */
+export type AlertResolveReason =
+  | "condition_cleared"
+  | "node_offline"
+  | "node_removed"
+  | "metric_unavailable";
+
 export interface Alert {
   id: string;
   node_id: string;
+  hostname: string;
   rule_name: string;
+  metric: string;
+  target: string | null;
+  operator: string;
   severity: AlertSeverity;
   message: string;
   triggered_at: string;
   resolved_at: string | null;
+  resolved_reason: AlertResolveReason | null;
   value: number;
   threshold: number;
+}
+
+/** 「最近恢复」的保留时长，对应 [storage] alert_history_minutes。 */
+export interface AlertRetention {
+  history_minutes: number;
+}
+
+/** 管理鉴权状态：访客只读，管理动作需要登录。 */
+export interface SessionInfo {
+  auth_required: boolean;
+  authenticated: boolean;
+}
+
+// ---------- 推送渠道 ----------
+
+export type BarkAlgorithm = "aes128" | "aes192" | "aes256";
+export type BarkMode = "cbc" | "ecb" | "gcm";
+export type NotifySeverity = "info" | "warning" | "critical";
+
+/** 推送内容加密配置，与 Bark App 中的算法/模式/密钥/IV 一一对应。 */
+export interface BarkEncryption {
+  algorithm: BarkAlgorithm;
+  mode: BarkMode;
+  key: string;
+  iv: string | null;
+}
+
+export interface BarkChannelConfig {
+  kind: "bark";
+  server_url: string;
+  device_key: string;
+  encryption: BarkEncryption | null;
+}
+
+export interface NotifyChannel {
+  id: string;
+  name: string;
+  enabled: boolean;
+  min_severity: NotifySeverity;
+  config: BarkChannelConfig;
+  created_at: string;
+  updated_at: string;
+  last_sent_at: string | null;
+  last_error: string | null;
+}
+
+/** 新建/更新渠道时提交的字段。 */
+export interface NotifyChannelPayload {
+  name: string;
+  enabled: boolean;
+  min_severity: NotifySeverity;
+  config: BarkChannelConfig;
+}
+
+/** 服务端配置的推送默认值（来自 config.toml 的 [notify] server_url）。 */
+export interface NotifyDefaults {
+  server_url: string;
 }
 
 export interface ApiResponse<T> {

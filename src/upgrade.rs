@@ -112,7 +112,11 @@ pub struct UpgradeManager {
 
 impl UpgradeManager {
     pub fn new(config: UpgradeConfig, current_version: impl Into<String>) -> Result<Self> {
-        let client = build_http_client(config.proxy.as_deref())?;
+        let client = crate::http::build_client(
+            config.proxy.as_deref(),
+            Duration::from_secs(120),
+            &crate::http::user_agent(),
+        )?;
         let current_version = current_version.into();
         let status_file = default_upgrade_status_file();
         let persisted_status = status_file
@@ -251,7 +255,11 @@ impl UpgradeManager {
         )
         .await;
 
-        let client = build_http_client(proxy.as_deref().or(self.config.proxy.as_deref()))?;
+        let client = crate::http::build_client(
+            proxy.as_deref().or(self.config.proxy.as_deref()),
+            Duration::from_secs(120),
+            &crate::http::user_agent(),
+        )?;
         let release = self.fetch_latest_release(&client).await?;
         {
             let mut state = self.state.write().await;
@@ -489,18 +497,6 @@ impl UpgradeManager {
     }
 }
 
-fn build_http_client(proxy: Option<&str>) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .user_agent(format!("os-watcher/{}", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(120));
-
-    if let Some(proxy) = resolve_proxy(proxy) {
-        builder = builder.proxy(reqwest::Proxy::all(&proxy).context("configure upgrade proxy")?);
-    }
-
-    builder.build().context("build HTTP client")
-}
-
 fn default_upgrade_status_file() -> Option<PathBuf> {
     let current_exe = std::env::current_exe().ok()?;
     let install_dir = current_exe.parent()?;
@@ -555,25 +551,6 @@ async fn wait_for_persisted_terminal_status(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     None
-}
-
-fn resolve_proxy(explicit: Option<&str>) -> Option<String> {
-    if let Some(proxy) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
-        return Some(proxy.to_string());
-    }
-
-    [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ]
-    .into_iter()
-    .filter_map(|key| std::env::var(key).ok())
-    .map(|value| value.trim().to_string())
-    .find(|value| !value.is_empty())
 }
 
 pub fn current_platform() -> &'static str {
@@ -1281,9 +1258,6 @@ fn quote_powershell_arg(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static PROXY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn newer_versions_compare_numeric_segments() {
@@ -1364,30 +1338,6 @@ mod tests {
     }
 
     #[test]
-    fn environment_proxy_is_used_when_no_explicit_proxy_is_configured() {
-        with_isolated_proxy_env(|| {
-            std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:7890");
-
-            assert_eq!(
-                resolve_proxy(None).as_deref(),
-                Some("http://127.0.0.1:7890")
-            );
-        });
-    }
-
-    #[test]
-    fn explicit_proxy_takes_precedence_over_environment_proxy() {
-        with_isolated_proxy_env(|| {
-            std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:7890");
-
-            assert_eq!(
-                resolve_proxy(Some("http://10.0.0.1:8080")).as_deref(),
-                Some("http://10.0.0.1:8080")
-            );
-        });
-    }
-
-    #[test]
     fn pending_restart_for_current_version_is_confirmed_on_startup() {
         let recovered = recover_persisted_status(
             UpgradeStatus {
@@ -1455,34 +1405,5 @@ mod tests {
         );
         assert!(!install_dir.join("config.example.toml").exists());
         assert!(!install_dir.join("web-dist").exists());
-    }
-
-    fn with_isolated_proxy_env(test: impl FnOnce()) {
-        let _guard = PROXY_ENV_LOCK.lock().expect("proxy env lock poisoned");
-        const KEYS: [&str; 6] = [
-            "HTTPS_PROXY",
-            "https_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-        ];
-        let previous = KEYS
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect::<Vec<_>>();
-
-        for key in KEYS {
-            std::env::remove_var(key);
-        }
-        test();
-
-        for (key, value) in previous {
-            if let Some(value) = value {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
     }
 }

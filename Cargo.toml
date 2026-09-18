@@ -66,6 +66,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # musl cross-compilation.
 russh = { version = "0.62", default-features = false, features = ["ring"] }
 
+# Bark push payload encryption. Pure Rust only — a C dependency here would break
+# the musl/aarch64 cross builds that install just musl-tools and gcc-aarch64-linux-gnu.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+ecb = { version = "0.1", features = ["alloc", "block-padding"] }
+aes-gcm = "0.10"
+base64 = "0.22"
+
 [profile.release]
 opt-level = 3
 lto = true

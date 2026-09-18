@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Result};
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use std::time::Duration;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::types::*;
 
@@ -44,6 +45,21 @@ impl Database {
     }
 
     async fn run_migrations(&self) -> Result<()> {
+        // One-time rebuild of the pre-0.3 `alerts_log` shape: that table lacked
+        // hostname/metric/target/operator and had no writer (its only insert path
+        // was unreachable), so dropping it loses nothing. Once the new columns are
+        // present the table is left alone, so alert history survives restarts.
+        if self.table_exists("alerts_log").await? {
+            let columns: Vec<(String,)> =
+                sqlx::query_as("SELECT name FROM pragma_table_info('alerts_log')")
+                    .fetch_all(&self.pool)
+                    .await?;
+            if !columns.iter().any(|(name,)| name == "hostname") {
+                sqlx::query("DROP TABLE alerts_log").execute(&self.pool).await?;
+                warn!("Rebuilt alerts_log with the extended alert schema");
+            }
+        }
+
         sqlx::query(r#"
             CREATE TABLE IF NOT EXISTS metrics_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,14 +77,23 @@ impl Database {
                 ON metrics_history(node_id, timestamp);
             CREATE INDEX IF NOT EXISTS idx_metrics_time
                 ON metrics_history(timestamp, id);
-            CREATE TABLE IF NOT EXISTS alerts_log (
-                id TEXT PRIMARY KEY, node_id TEXT NOT NULL, rule_name TEXT NOT NULL,
-                severity TEXT NOT NULL, message TEXT NOT NULL, triggered_at TEXT NOT NULL,
-                resolved_at TEXT, value REAL NOT NULL, threshold REAL NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS nodes_seen (
                 id TEXT PRIMARY KEY, hostname TEXT NOT NULL, api_addr TEXT NOT NULL,
                 gossip_addr TEXT NOT NULL, last_seen TEXT NOT NULL, version TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS alerts_log (
+                id TEXT PRIMARY KEY, node_id TEXT NOT NULL, hostname TEXT NOT NULL,
+                rule_name TEXT NOT NULL, metric TEXT NOT NULL, target TEXT,
+                operator TEXT NOT NULL, severity TEXT NOT NULL, message TEXT NOT NULL,
+                value REAL NOT NULL, threshold REAL NOT NULL,
+                triggered_at TEXT NOT NULL, resolved_at TEXT, resolved_reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_alerts_triggered_at ON alerts_log(triggered_at DESC);
+            CREATE TABLE IF NOT EXISTS notify_channels (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, enabled INTEGER NOT NULL,
+                min_severity TEXT NOT NULL, config_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                last_sent_at TEXT, last_error TEXT
             );
         "#)
         .execute(&self.pool)
@@ -189,26 +214,182 @@ impl Database {
         Ok(metrics)
     }
 
-    /// Store an alert
+    /// Persist a newly triggered (or restored) alert.
     pub async fn store_alert(&self, alert: &Alert) -> Result<()> {
         sqlx::query(r#"
             INSERT OR REPLACE INTO alerts_log
-                (id, node_id, rule_name, severity, message, triggered_at, resolved_at, value, threshold)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, node_id, hostname, rule_name, metric, target, operator, severity,
+                 message, value, threshold, triggered_at, resolved_at, resolved_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#)
         .bind(alert.id.to_string())
         .bind(alert.node_id.to_string())
+        .bind(&alert.hostname)
         .bind(&alert.rule_name)
-        .bind(format!("{:?}", alert.severity))
+        .bind(&alert.metric)
+        .bind(alert.target.as_deref())
+        .bind(&alert.operator)
+        .bind(alert_severity_str(alert.severity))
         .bind(&alert.message)
-        .bind(alert.triggered_at.to_rfc3339())
-        .bind(alert.resolved_at.map(|t| t.to_rfc3339()))
         .bind(alert.value)
         .bind(alert.threshold)
+        .bind(alert.triggered_at.to_rfc3339())
+        .bind(alert.resolved_at.map(|t| t.to_rfc3339()))
+        .bind(alert.resolved_reason.map(resolve_reason_str))
         .execute(&self.pool)
         .await?;
 
         Ok(())
+    }
+
+    /// Record that an alert has been resolved.
+    pub async fn mark_alert_resolved(&self, alert: &Alert) -> Result<()> {
+        sqlx::query("UPDATE alerts_log SET resolved_at = ?, resolved_reason = ? WHERE id = ?")
+            .bind(alert.resolved_at.map(|t| t.to_rfc3339()))
+            .bind(alert.resolved_reason.map(resolve_reason_str))
+            .bind(alert.id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Alerts that were still active when the process last stopped.
+    pub async fn load_active_alerts(&self) -> Result<Vec<Alert>> {
+        let rows: Vec<AlertRow> = sqlx::query_as(
+            "SELECT id, node_id, hostname, rule_name, metric, target, operator, severity,
+                    message, value, threshold, triggered_at, resolved_at, resolved_reason
+             FROM alerts_log WHERE resolved_at IS NULL ORDER BY triggered_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let alerts: Vec<Alert> = rows.into_iter().filter_map(alert_from_row).collect();
+        Ok(alerts)
+    }
+
+    /// Recently resolved alerts, newest first.
+    pub async fn recent_resolved_alerts(&self, limit: i64) -> Result<Vec<Alert>> {
+        let rows: Vec<AlertRow> = sqlx::query_as(
+            "SELECT id, node_id, hostname, rule_name, metric, target, operator, severity,
+                    message, value, threshold, triggered_at, resolved_at, resolved_reason
+             FROM alerts_log WHERE resolved_at IS NOT NULL
+             ORDER BY resolved_at DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let alerts: Vec<Alert> = rows.into_iter().filter_map(alert_from_row).collect();
+        Ok(alerts)
+    }
+
+    /// Delete resolved alerts older than `cutoff`.
+    ///
+    /// The panel shows 最近恢复 straight from this table, so expired rows must
+    /// leave the database too — otherwise they reappear in the history after a
+    /// restart even though the in-memory copy was pruned.
+    pub async fn purge_resolved_alerts(&self, cutoff: DateTime<Utc>) -> Result<u64> {
+        let cutoff_str = cutoff.to_rfc3339();
+        let result = sqlx::query(
+            "DELETE FROM alerts_log WHERE resolved_at IS NOT NULL AND resolved_at < ?",
+        )
+        .bind(&cutoff_str)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// All configured push channels, oldest first.
+    pub async fn list_notify_channels(&self) -> Result<Vec<NotifyChannel>> {
+        let rows: Vec<ChannelRow> = sqlx::query_as(
+                "SELECT id, name, enabled, min_severity, config_json, created_at, updated_at,
+                        last_sent_at, last_error
+                 FROM notify_channels ORDER BY created_at ASC",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows.into_iter().filter_map(channel_from_row).collect())
+    }
+
+    pub async fn get_notify_channel(&self, id: &Uuid) -> Result<Option<NotifyChannel>> {
+        let row: Option<ChannelRow> = sqlx::query_as(
+                "SELECT id, name, enabled, min_severity, config_json, created_at, updated_at,
+                        last_sent_at, last_error
+                 FROM notify_channels WHERE id = ?",
+            )
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row.and_then(channel_from_row))
+    }
+
+    pub async fn upsert_notify_channel(&self, channel: &NotifyChannel) -> Result<()> {
+        let config_json = serde_json::to_string(&channel.config)?;
+        sqlx::query(r#"
+            INSERT OR REPLACE INTO notify_channels
+                (id, name, enabled, min_severity, config_json, created_at, updated_at,
+                 last_sent_at, last_error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#)
+        .bind(channel.id.to_string())
+        .bind(&channel.name)
+        .bind(channel.enabled as i64)
+        .bind(channel_severity_str(channel.min_severity))
+        .bind(&config_json)
+        .bind(channel.created_at.to_rfc3339())
+        .bind(channel.updated_at.to_rfc3339())
+        .bind(channel.last_sent_at.map(|t| t.to_rfc3339()))
+        .bind(channel.last_error.as_deref())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete a channel, returning the number of affected rows.
+    pub async fn delete_notify_channel(&self, id: &Uuid) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM notify_channels WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Record the outcome of a push attempt: `None` marks a successful send
+    /// (stamping `last_sent_at` and clearing the error), `Some` stores the error.
+    pub async fn record_notify_result(&self, id: &Uuid, error: Option<&str>) -> Result<()> {
+        match error {
+            None => {
+                sqlx::query("UPDATE notify_channels SET last_sent_at = ?, last_error = NULL WHERE id = ?")
+                    .bind(Utc::now().to_rfc3339())
+                    .bind(id.to_string())
+                    .execute(&self.pool)
+                    .await?;
+            }
+            Some(message) => {
+                let truncated: String = message.chars().take(500).collect();
+                sqlx::query("UPDATE notify_channels SET last_error = ? WHERE id = ?")
+                    .bind(truncated)
+                    .bind(id.to_string())
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a table exists in the schema.
+    async fn table_exists(&self, name: &str) -> Result<bool> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
     }
 
     /// Upsert node info
@@ -243,6 +424,151 @@ impl Database {
         .await?;
 
         Ok(result.rows_affected())
+    }
+}
+
+/// Column tuple of an `alerts_log` row.
+type AlertRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    f64,
+    f64,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+/// Column tuple of a `notify_channels` row.
+type ChannelRow = (
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+fn alert_from_row(row: AlertRow) -> Option<Alert> {
+    let (
+        id,
+        node_id,
+        hostname,
+        rule_name,
+        metric,
+        target,
+        operator,
+        severity,
+        message,
+        value,
+        threshold,
+        triggered_at,
+        resolved_at,
+        resolved_reason,
+    ) = row;
+
+    Some(Alert {
+        id: Uuid::parse_str(&id).ok()?,
+        node_id: Uuid::parse_str(&node_id).ok()?,
+        hostname,
+        rule_name,
+        metric,
+        target,
+        operator,
+        severity: alert_severity_from(&severity),
+        message,
+        triggered_at: parse_time(&triggered_at)?,
+        resolved_at: resolved_at.as_deref().and_then(parse_time),
+        resolved_reason: resolved_reason.as_deref().and_then(resolve_reason_from),
+        value,
+        threshold,
+    })
+}
+
+fn channel_from_row(row: ChannelRow) -> Option<NotifyChannel> {
+    let (id, name, enabled, min_severity, config_json, created_at, updated_at, last_sent_at, last_error) =
+        row;
+
+    let config: ChannelConfig = serde_json::from_str(&config_json).ok()?;
+
+    Some(NotifyChannel {
+        id: Uuid::parse_str(&id).ok()?,
+        name,
+        enabled: enabled != 0,
+        min_severity: channel_severity_from(&min_severity),
+        config,
+        created_at: parse_time(&created_at)?,
+        updated_at: parse_time(&updated_at)?,
+        last_sent_at: last_sent_at.as_deref().and_then(parse_time),
+        last_error,
+    })
+}
+
+fn parse_time(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|time| time.with_timezone(&Utc))
+}
+
+/// Severity as stored in SQLite. Deliberately explicit instead of `{:?}` or the
+/// serde representation, so a later rename of either cannot silently break reads.
+fn alert_severity_str(severity: AlertSeverity) -> &'static str {
+    match severity {
+        AlertSeverity::Info => "info",
+        AlertSeverity::Warning => "warning",
+        AlertSeverity::Critical => "critical",
+    }
+}
+
+fn alert_severity_from(value: &str) -> AlertSeverity {
+    match value {
+        "info" => AlertSeverity::Info,
+        "critical" => AlertSeverity::Critical,
+        _ => AlertSeverity::Warning,
+    }
+}
+
+fn resolve_reason_str(reason: AlertResolveReason) -> &'static str {
+    match reason {
+        AlertResolveReason::ConditionCleared => "condition_cleared",
+        AlertResolveReason::NodeOffline => "node_offline",
+        AlertResolveReason::NodeRemoved => "node_removed",
+        AlertResolveReason::MetricUnavailable => "metric_unavailable",
+    }
+}
+
+fn resolve_reason_from(value: &str) -> Option<AlertResolveReason> {
+    match value {
+        "condition_cleared" => Some(AlertResolveReason::ConditionCleared),
+        "node_offline" => Some(AlertResolveReason::NodeOffline),
+        "node_removed" => Some(AlertResolveReason::NodeRemoved),
+        "metric_unavailable" => Some(AlertResolveReason::MetricUnavailable),
+        _ => None,
+    }
+}
+
+fn channel_severity_str(severity: NotifySeverity) -> &'static str {
+    match severity {
+        NotifySeverity::Info => "info",
+        NotifySeverity::Warning => "warning",
+        NotifySeverity::Critical => "critical",
+    }
+}
+
+fn channel_severity_from(value: &str) -> NotifySeverity {
+    match value {
+        "info" => NotifySeverity::Info,
+        "critical" => NotifySeverity::Critical,
+        _ => NotifySeverity::Warning,
     }
 }
 
@@ -345,5 +671,61 @@ mod tests {
         db.store_metrics(&node_id, &metrics(Utc::now(), 100)).await.unwrap();
         assert_eq!(db.cleanup_old_metrics(1).await.unwrap(), 1);
         assert_eq!(history_count(&db).await, 1);
+    }
+
+    fn alert(rule_name: &str, resolved_at: Option<chrono::DateTime<Utc>>) -> Alert {
+        Alert {
+            id: Uuid::new_v4(),
+            node_id: Uuid::new_v4(),
+            hostname: "test".to_string(),
+            rule_name: rule_name.to_string(),
+            metric: "cpu".to_string(),
+            target: None,
+            operator: "gt".to_string(),
+            severity: AlertSeverity::Warning,
+            message: "test".to_string(),
+            triggered_at: Utc::now() - ChronoDuration::minutes(30),
+            resolved_at,
+            resolved_reason: resolved_at.map(|_| AlertResolveReason::ConditionCleared),
+            value: 95.0,
+            threshold: 90.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_removes_only_expired_resolved_alerts() {
+        let dir = tempdir().expect("temp directory should be created");
+        let db = Database::new_with_limit(dir.path().join("alerts.db").to_str().unwrap(), 128 * 1024)
+            .await.expect("database should initialize");
+
+        let mut expired = alert("expired", None);
+        let mut recent = alert("recent", None);
+        let active = alert("active", None);
+        for entry in [&expired, &recent, &active] {
+            db.store_alert(entry).await.expect("alert should be stored");
+        }
+        // Resolved rows are written by `mark_alert_resolved`, exactly as at runtime.
+        expired.resolved_at = Some(Utc::now() - ChronoDuration::minutes(11));
+        expired.resolved_reason = Some(AlertResolveReason::ConditionCleared);
+        recent.resolved_at = Some(Utc::now() - ChronoDuration::minutes(2));
+        recent.resolved_reason = Some(AlertResolveReason::ConditionCleared);
+        db.mark_alert_resolved(&expired).await.unwrap();
+        db.mark_alert_resolved(&recent).await.unwrap();
+
+        let cutoff = Utc::now() - ChronoDuration::minutes(10);
+        assert_eq!(db.purge_resolved_alerts(cutoff).await.unwrap(), 1);
+        // Running again is a no-op: the boundary row stays until it expires too.
+        assert_eq!(db.purge_resolved_alerts(cutoff).await.unwrap(), 0);
+
+        let remaining: Vec<(String,)> =
+            sqlx::query_as("SELECT rule_name FROM alerts_log ORDER BY rule_name")
+                .fetch_all(&db.pool)
+                .await
+                .expect("alerts should be readable");
+        assert_eq!(
+            remaining.into_iter().map(|(name,)| name).collect::<Vec<_>>(),
+            vec!["active".to_string(), "recent".to_string()],
+            "an unresolved alert must survive the purge"
+        );
     }
 }
