@@ -273,6 +273,12 @@ impl UpgradeManager {
             return Err(anyhow!("unsupported upgrade platform"));
         }
 
+        // The upgrade replaces the binary and restarts the service, so it can
+        // only ever succeed when a service is registered. Check before
+        // downloading so a hand-started process reports the real problem
+        // instead of downloading, staging, and rolling back.
+        ensure_service_registered(&self.config.service_name).await?;
+
         let asset = select_asset(&release.assets, platform, package)
             .ok_or_else(|| anyhow!("release asset not found for {platform}/{package}"))?
             .clone();
@@ -419,6 +425,24 @@ impl UpgradeManager {
             if matches!(phase, UpgradePhase::Failed | UpgradePhase::RolledBack) {
                 return Err(anyhow!(message));
             }
+        } else {
+            // The restart helper owns the outcome once it runs; if it dies without
+            // writing a terminal status the upgrade silently looks successful, so
+            // surface the stall instead of leaving the last `restarting` state.
+            let message = format!(
+                "restart helper did not report a terminal status within 90s; inspect {}",
+                status_file.display()
+            );
+            self.set_status(
+                UpgradePhase::Failed,
+                false,
+                message.clone(),
+                Some(package),
+                Some(release.tag_name.clone()),
+            )
+            .await;
+            self.persist_current_status_to(&status_file).await?;
+            return Err(anyhow!(message));
         }
 
         if let Err(err) = fs::remove_dir_all(&temp_root) {
@@ -509,7 +533,9 @@ fn upgrade_status_file(install_dir: &Path) -> PathBuf {
 
 fn read_persisted_status(path: &Path) -> Option<UpgradeStatus> {
     let content = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    // PowerShell 5.1's `Set-Content -Encoding UTF8` emits a UTF-8 BOM, so status
+    // files written by older builds start with one; strip it before parsing.
+    serde_json::from_str(content.trim_start_matches('\u{feff}')).ok()
 }
 
 fn write_persisted_status(path: &Path, status: &UpgradeStatus) -> Result<()> {
@@ -744,7 +770,8 @@ fn backup_current_install(current_exe: &Path, install_dir: &Path, backup_dir: &P
 }
 
 fn install_payload(payload_root: &Path, install_dir: &Path, current_exe: &Path) -> Result<()> {
-    let exe_name = file_name(current_exe)?;
+    let binary_name = canonical_binary_name();
+    let mut staged_binary = false;
     for entry in fs::read_dir(payload_root)
         .with_context(|| format!("read payload root {}", payload_root.display()))?
     {
@@ -753,8 +780,13 @@ fn install_payload(payload_root: &Path, install_dir: &Path, current_exe: &Path) 
         let src = entry.path();
         let dst = install_dir.join(&name);
 
-        if name == exe_name {
+        // Match the archive's own binary name rather than the running file name:
+        // the running executable may have been renamed, and comparing against it
+        // would skip staging and then report a successful upgrade that never
+        // replaced the binary.
+        if name.as_os_str() == OsStr::new(binary_name) {
             stage_binary_replacement(&src, current_exe)?;
+            staged_binary = true;
         } else if src.is_dir() {
             if dst.exists() {
                 fs::remove_dir_all(&dst)
@@ -764,7 +796,16 @@ fn install_payload(payload_root: &Path, install_dir: &Path, current_exe: &Path) 
         } else if src.is_file() {
             fs::copy(&src, &dst)
                 .with_context(|| format!("copy {} to {}", src.display(), dst.display()))?;
+            if name.as_os_str() == OsStr::new(DEPLOY_SCRIPT_NAME) {
+                set_executable(&dst)?;
+            }
         }
+    }
+
+    if !staged_binary {
+        return Err(anyhow!(
+            "release archive did not contain the {binary_name} binary"
+        ));
     }
 
     Ok(())
@@ -875,12 +916,37 @@ fn file_name(path: &Path) -> Result<std::ffi::OsString> {
         .ok_or_else(|| anyhow!("path has no file name: {}", path.display()))
 }
 
+/// Name of the binary inside every release archive.
+///
+/// The running executable is normally this name, but users do rename it (for
+/// example to keep a hand-downloaded build beside the installed one). Matching
+/// the payload against this name keeps upgrades working in that case instead of
+/// silently copying the new binary into place without staging it.
+fn canonical_binary_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "os-watcher.exe"
+    } else {
+        "os-watcher"
+    }
+}
+
+/// Release archives may carry `deploy.sh` without its executable bit: `tar`
+/// derives the mode from the packing machine's umask, and the git index mode
+/// (`100644`) wins for `git archive`. Restore it on install so a node that
+/// upgraded itself can still be re-deployed by running the script directly.
+const DEPLOY_SCRIPT_NAME: &str = "deploy.sh";
+
 #[cfg(unix)]
 fn set_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = fs::metadata(path)?.permissions();
     perms.set_mode(0o755);
     fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn set_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -980,6 +1046,33 @@ async fn schedule_service_restart(request: &UpgradeHelperRequest) -> Result<()> 
 
 #[cfg(target_os = "windows")]
 async fn schedule_service_restart(request: &UpgradeHelperRequest) -> Result<()> {
+    let script = windows_restart_script(request)?;
+    let launcher = windows_restart_launcher(&script);
+    let status = tokio::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &launcher,
+        ])
+        .status()
+        .await
+        .context("schedule Windows service restart")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "failed to schedule Windows service restart: {status}"
+        ));
+    }
+    Ok(())
+}
+
+/// Build the PowerShell script that stops the service, swaps in the staged
+/// binary, restarts it, and records the outcome in the status file.
+#[cfg(target_os = "windows")]
+fn windows_restart_script(request: &UpgradeHelperRequest) -> Result<String> {
     let staged = windows_staged_exe_path(&request.current_exe);
     let backup_exe = request.backup_dir.join(file_name(&request.current_exe)?);
     let config = request.install_dir.join("config.toml");
@@ -988,7 +1081,7 @@ async fn schedule_service_restart(request: &UpgradeHelperRequest) -> Result<()> 
     let backup_config_example = request.backup_dir.join("config.example.toml");
     let web_dist = request.install_dir.join("web-dist");
     let backup_web_dist = request.backup_dir.join("web-dist");
-    let script = format!(
+    Ok(format!(
         r#"
 $ErrorActionPreference = 'Stop'
 function Write-UpgradeStatus([string]$phase, [bool]$running, [string]$message) {{
@@ -1001,7 +1094,10 @@ function Write-UpgradeStatus([string]$phase, [bool]$running, [string]$message) {
     started_at = $null
     finished_at = (Get-Date).ToUniversalTime().ToString('o')
   }}
-  $status | ConvertTo-Json -Compress | Set-Content -LiteralPath {status_file} -Encoding UTF8
+  $json = $status | ConvertTo-Json -Compress
+  # PowerShell 5.1's UTF8 file encoding emits a BOM, which the parent process
+  # cannot parse as JSON. Write UTF-8 without a BOM explicitly.
+  [System.IO.File]::WriteAllText({status_file}, $json, (New-Object System.Text.UTF8Encoding $false))
 }}
 
 function Wait-ServiceState([string]$name, [string]$state, [int]$timeoutSeconds) {{
@@ -1018,6 +1114,10 @@ function Wait-ServiceState([string]$name, [string]$state, [int]$timeoutSeconds) 
 
 try {{
   Start-Sleep -Seconds 1
+  sc.exe query {svc} | Out-Null
+  if ($LASTEXITCODE -ne 0) {{
+    throw "service {svc} is not installed; run deploy.sh --package {package_kind} on this host to register it"
+  }}
   sc.exe stop {svc} | Out-Null
   if ($LASTEXITCODE -ne 0) {{
     throw 'service stop command failed'
@@ -1064,6 +1164,7 @@ try {{
 }}
 "#,
         svc = quote_powershell_arg(&request.service_name),
+        package_kind = request.package.as_str(),
         staged = quote_powershell(&staged),
         exe = quote_powershell(&request.current_exe),
         package = quote_powershell_arg(request.package.as_str()),
@@ -1076,29 +1177,31 @@ try {{
         config = quote_powershell(&config),
         config_example = quote_powershell(&config_example),
         web_dist = quote_powershell(&web_dist),
+    ))
+}
+
+/// Wrap the restart script in the command line that launches it.
+///
+/// The script travels as a single base64 (UTF-16LE) token. Handing it to
+/// `Start-Process -ArgumentList` instead makes PowerShell strip every double
+/// quote while re-parsing the child command line, which truncated status
+/// messages to their first word and broke the interpolated paths.
+///
+/// The launch itself goes through WMI rather than `Start-Process`: the service
+/// manager puts the service process in a job object, so a child process is
+/// killed the moment the service stops -- exactly when the helper still has to
+/// replace the binary and start the service again. WMI spawns the helper from
+/// WmiPrvSE, outside that job, so it survives the stop it performs.
+#[cfg(target_os = "windows")]
+fn windows_restart_launcher(script: &str) -> String {
+    let command_line = format!(
+        "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand {}",
+        encode_powershell_command(script)
     );
-    let status = tokio::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-WindowStyle",
-            "Hidden",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &format!(
-                "Start-Process powershell -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command',{})",
-                quote_powershell_arg(&script)
-            ),
-        ])
-        .status()
-        .await
-        .context("schedule Windows service restart")?;
-    if !status.success() {
-        return Err(anyhow!(
-            "failed to schedule Windows service restart: {status}"
-        ));
-    }
-    Ok(())
+    format!(
+        "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine={}}} | Out-Null",
+        quote_powershell_arg(&command_line)
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -1132,6 +1235,33 @@ fn helper_args(request: &UpgradeHelperRequest, service_name: &str) -> Vec<String
 async fn restart_service_and_wait(service_name: &str) -> Result<()> {
     restart_service(service_name).await?;
     wait_service_active(service_name, Duration::from_secs(30)).await
+}
+
+/// Fail early when the configured service is not registered.
+///
+/// Windows nodes started by hand (no `deploy.sh` run, or `nssm` missing) have no
+/// service to stop, so every `sc.exe` call fails and the upgrade rolls back with
+/// a misleading "restart failed" message. Linux already fails on the first
+/// `systemctl restart`; this gives Windows the same early, explicit signal.
+#[cfg(target_os = "windows")]
+async fn ensure_service_registered(service_name: &str) -> Result<()> {
+    let status = tokio::process::Command::new("sc.exe")
+        .arg("query")
+        .arg(service_name)
+        .status()
+        .await
+        .context("query Windows service registration")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "service {service_name} is not registered; register it with deploy.sh --package node|full before upgrading"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn ensure_service_registered(_service_name: &str) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1255,6 +1385,21 @@ fn quote_powershell_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// Encode a script for `powershell -EncodedCommand`.
+///
+/// The switch expects base64 over UTF-16LE. Passing the script this way keeps it
+/// a single token with no quotes or newlines, so the child process receives it
+/// verbatim instead of being re-parsed as a command line.
+#[cfg(target_os = "windows")]
+fn encode_powershell_command(script: &str) -> String {
+    use base64::Engine;
+    let utf16: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+    base64::engine::general_purpose::STANDARD.encode(utf16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1373,6 +1518,181 @@ mod tests {
 
         assert!(recovered.running);
         assert_eq!(recovered.phase, UpgradePhase::Restarting);
+    }
+
+    #[test]
+    fn persisted_status_tolerates_utf8_bom() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let path = temp.path().join("status.json");
+        let status = UpgradeStatus {
+            running: false,
+            phase: UpgradePhase::Failed,
+            message: "restart failed: boom".to_string(),
+            package: Some(PackageKind::Full),
+            target_version: Some("v0.1.2".to_string()),
+            started_at: None,
+            finished_at: Some(Utc::now()),
+        };
+        let json = serde_json::to_string(&status).expect("status should serialize");
+        fs::write(&path, format!("\u{feff}{json}")).expect("status file should be written");
+
+        let read = read_persisted_status(&path)
+            .expect("a status file written by PowerShell 5.1 must still parse");
+
+        assert_eq!(read.phase, UpgradePhase::Failed);
+        assert_eq!(read.message, "restart failed: boom");
+    }
+
+    #[test]
+    fn install_payload_stages_binary_when_running_executable_was_renamed() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let install_dir = temp.path().join("install");
+        let payload_root = temp.path().join("payload");
+        fs::create_dir_all(&install_dir).expect("install dir should be created");
+        fs::create_dir_all(&payload_root).expect("payload dir should be created");
+
+        // A user-renamed binary must not stop the archive's binary from being staged.
+        let running_exe = install_dir.join(if cfg!(target_os = "windows") {
+            "os-watcher_new.exe"
+        } else {
+            "os-watcher_new"
+        });
+        fs::write(&running_exe, "old").expect("running executable should be written");
+        fs::write(payload_root.join(canonical_binary_name()), "new")
+            .expect("archive binary should be written");
+
+        install_payload(&payload_root, &install_dir, &running_exe)
+            .expect("install should stage the archive binary");
+
+        #[cfg(target_os = "windows")]
+        let replaced = windows_staged_exe_path(&running_exe);
+        #[cfg(not(target_os = "windows"))]
+        let replaced = running_exe.clone();
+
+        assert_eq!(
+            fs::read_to_string(&replaced).expect("staged binary should be readable"),
+            "new"
+        );
+    }
+
+    #[test]
+    fn install_payload_rejects_archive_without_binary() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let install_dir = temp.path().join("install");
+        let payload_root = temp.path().join("payload");
+        fs::create_dir_all(&install_dir).expect("install dir should be created");
+        fs::create_dir_all(&payload_root).expect("payload dir should be created");
+        fs::write(payload_root.join("README.md"), "docs").expect("readme should be written");
+        let running_exe = install_dir.join(canonical_binary_name());
+        fs::write(&running_exe, "old").expect("running executable should be written");
+
+        let err = install_payload(&payload_root, &install_dir, &running_exe)
+            .expect_err("an archive without the binary must not report success");
+
+        assert!(err.to_string().contains("did not contain"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_payload_restores_executable_bit_on_deploy_script() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let install_dir = temp.path().join("install");
+        let payload_root = temp.path().join("payload");
+        fs::create_dir_all(&install_dir).expect("install dir should be created");
+        fs::create_dir_all(&payload_root).expect("payload dir should be created");
+        let running_exe = install_dir.join(canonical_binary_name());
+        fs::write(&running_exe, "old").expect("running executable should be written");
+        fs::write(payload_root.join(canonical_binary_name()), "new")
+            .expect("archive binary should be written");
+
+        // Release tarballs carry deploy.sh without its executable bit.
+        let payload_script = payload_root.join(DEPLOY_SCRIPT_NAME);
+        fs::write(&payload_script, "#!/usr/bin/env bash\ntrue\n")
+            .expect("deploy script should be written");
+        fs::set_permissions(&payload_script, fs::Permissions::from_mode(0o644))
+            .expect("deploy script should be made non-executable");
+
+        install_payload(&payload_root, &install_dir, &running_exe)
+            .expect("install should restore the deploy script mode");
+
+        let installed = install_dir.join(DEPLOY_SCRIPT_NAME);
+        let mode = fs::metadata(&installed)
+            .expect("installed deploy script should exist")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "installed deploy.sh must stay runnable after an upgrade"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_restart_script_writes_status_without_bom() {
+        let request = windows_test_request();
+        let script = windows_restart_script(&request).expect("script should be built");
+
+        assert!(
+            script.contains("[System.IO.File]::WriteAllText"),
+            "status must be written as BOM-less UTF-8 so the parent can parse it"
+        );
+        assert!(
+            !script.contains("Set-Content"),
+            "status must not go through Set-Content, whose UTF8 encoding adds a BOM on PowerShell 5.1"
+        );
+        assert!(
+            script.contains("sc.exe query") && script.contains("is not installed"),
+            "the helper must report an unregistered service instead of a bare restart failure"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_restart_launcher_round_trips_script_as_single_token() {
+        let request = windows_test_request();
+        let script = windows_restart_script(&request).expect("script should be built");
+        let launcher = windows_restart_launcher(&script);
+
+        assert!(
+            !launcher.contains("Start-Process"),
+            "a re-parsed argument list strips the quotes inside the script"
+        );
+
+        let encoded = encode_powershell_command(&script);
+        assert!(
+            launcher.contains(&format!("-EncodedCommand {encoded}")),
+            "the launcher must pass the encoded script verbatim"
+        );
+
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded)
+            .expect("encoded script should be valid base64");
+        let units = raw
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            String::from_utf16(&units).expect("encoded script should be UTF-16"),
+            script,
+            "the child process must receive the script byte for byte"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_test_request() -> UpgradeHelperRequest {
+        UpgradeHelperRequest {
+            service_name: "os-watcher".to_string(),
+            current_exe: PathBuf::from(r"C:\Program Files\os-watcher\os-watcher.exe"),
+            install_dir: PathBuf::from(r"C:\Program Files\os-watcher"),
+            backup_dir: PathBuf::from(r"C:\Program Files\os-watcher\backups\upgrade-1"),
+            status_file: PathBuf::from(
+                r"C:\Program Files\os-watcher\.os-watcher-upgrade-status.json",
+            ),
+            target_version: "v0.1.2".to_string(),
+            package: PackageKind::Full,
+        }
     }
 
     #[test]
