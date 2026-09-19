@@ -1239,7 +1239,7 @@ async fn restart_service_and_wait(service_name: &str) -> Result<()> {
 
 /// Fail early when the configured service is not registered.
 ///
-/// Windows nodes started by hand (no `deploy.sh` run, or `nssm` missing) have no
+/// Windows nodes started by hand (no `deploy.sh`/`deploy.ps1` run) have no
 /// service to stop, so every `sc.exe` call fails and the upgrade rolls back with
 /// a misleading "restart failed" message. Linux already fails on the first
 /// `systemctl restart`; this gives Windows the same early, explicit signal.

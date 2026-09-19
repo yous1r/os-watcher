@@ -35,6 +35,9 @@ clap = { version = "4", features = ["derive"] }
 # Logging/Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Off-thread log file writer for `--log-file`, and the default log destination
+# of a Windows service, which has no stdout to write to.
+tracing-appender = "0.2"
 
 # Database
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros", "chrono"] }
@@ -93,6 +96,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinSock",
     "Win32_System_IO",
 ] }
+
+# Service Control Manager protocol (see src/service.rs). Without it `sc.exe`
+# cannot host the binary at all: the SCM requires the process to call
+# StartServiceCtrlDispatcherW, which a console program never does.
+windows-service = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

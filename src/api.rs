@@ -768,6 +768,18 @@ pub fn create_router(api_state: ApiState, web_dir: Option<&str>) -> Router {
     app.layer(CorsLayer::permissive())
 }
 
+/// Bind the API listener without serving on it.
+///
+/// Split out so startup can fail loudly before the process claims to be up:
+/// binding only inside the spawned task would turn a port clash into an error
+/// logged after the caller already reported success.
+pub async fn bind_listener(bind_addr: &str, port: u16) -> Result<tokio::net::TcpListener> {
+    let addr = format!("{}:{}", bind_addr, port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    info!("API server listening on http://{}", addr);
+    Ok(listener)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_api_server(
     state: SharedState,
@@ -779,14 +791,9 @@ pub async fn run_api_server(
     notify: NotificationService,
     auth: AuthManager,
     alert_history_minutes: u64,
-    bind_addr: &str,
-    port: u16,
+    listener: tokio::net::TcpListener,
     web_dir: Option<String>,
 ) -> Result<()> {
-    let addr = format!("{}:{}", bind_addr, port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("API server listening on http://{}", addr);
-
     let api_state = ApiState::new(
         state,
         upgrade,

@@ -9,6 +9,7 @@ mod diskstats;
 mod gossip;
 mod http;
 mod notify;
+mod service;
 mod smart;
 mod state;
 mod storage;
@@ -16,11 +17,14 @@ mod tui;
 mod types;
 mod upgrade;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use std::{path::PathBuf, sync::Arc};
+use std::{path::Path, path::PathBuf, sync::Arc};
 use tracing::{error, info};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -31,7 +35,7 @@ use crate::state::new_shared_state;
 use crate::types::{NodeInfo, NodeStatus};
 use crate::upgrade::{UpgradeHelperRequest, UpgradeManager};
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(
     name = "os-watcher",
     about = "Decentralized host resource monitor",
@@ -46,11 +50,17 @@ struct Cli {
     #[arg(short, long, default_value = "info")]
     log_level: String,
 
+    /// Append logs to this file instead of writing them to stdout.
+    /// A Windows service defaults to `os-watcher.log` next to the executable,
+    /// because a service has no console to log to.
+    #[arg(long)]
+    log_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Commands {
     /// Start the monitoring agent (default)
     Start {
@@ -107,20 +117,76 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Init logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level)),
+    // A process the SCM launched has to talk to the SCM before doing anything
+    // else; `dispatch` blocks until the service stops. It returns `false` for
+    // an ordinary console launch, which then runs as before. Keeping this out
+    // of an async runtime matters: the call parks its thread for the whole
+    // service lifetime.
+    if service::dispatch(&cli)? {
+        return Ok(());
+    }
+
+    // The guard owns the background writer thread, so it has to outlive the
+    // run; dropping it early silently loses the tail of the log.
+    let _log_guard = init_logging(&cli.log_level, cli.log_file.clone())?;
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build the async runtime")?
+        .block_on(run(cli))
+}
+
+/// Install the tracing subscriber, to stdout or to a log file.
+///
+/// Returns a guard that must stay alive for as long as logging is wanted: it
+/// owns the background writer behind `--log-file`. Without a log file the guard
+/// is `None` and logs go to stdout, which is what the console path wants.
+pub fn init_logging(level: &str, log_file: Option<PathBuf>) -> Result<Option<WorkerGuard>> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+
+    let Some(path) = log_file else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .compact()
+            .init();
+        return Ok(None);
+    };
+
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create log directory {}", dir.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("log file path {} names no file", path.display()))?;
+
+    let (writer, guard) =
+        tracing_appender::non_blocking(tracing_appender::rolling::never(dir, name));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .compact()
+                // Escape codes would just be noise in a file.
+                .with_ansi(false)
+                .with_writer(writer),
         )
-        .with_target(false)
-        .compact()
         .init();
 
-    match cli.command.unwrap_or(Commands::Start {
+    Ok(Some(guard))
+}
+
+/// Everything that needs a runtime, shared by the console and service paths.
+async fn run(cli: Cli) -> Result<()> {
+    match cli.command.clone().unwrap_or(Commands::Start {
         gossip_port: None,
         api_port: None,
         peers: None,
@@ -167,9 +233,10 @@ async fn main() -> Result<()> {
             web_dir,
         } => {
             // Load or default config
-            let mut cfg = match load_config(&cli.config) {
+            let config_path = service::anchor(&cli.config);
+            let mut cfg = match load_config(&config_path.to_string_lossy()) {
                 Ok(c) => {
-                    info!("Loaded config from {}", cli.config);
+                    info!("Loaded config from {}", config_path.display());
                     c
                 }
                 Err(_) => {
@@ -177,6 +244,12 @@ async fn main() -> Result<()> {
                     Config::default()
                 }
             };
+
+            // A service inherits `System32` as its working directory, so the
+            // relative paths a released config ships with would put the
+            // database there and look for the dashboard there. A console run
+            // keeps its own directory, so this is a service-only rewrite.
+            anchor_relative_paths(&mut cfg, service::install_dir().as_deref());
 
             // Apply CLI overrides
             if let Some(p) = gossip_port {
@@ -219,6 +292,23 @@ fn parse_package_kind(value: &str) -> Result<PackageKind> {
         "full" => Ok(PackageKind::Full),
         _ => Err(anyhow::anyhow!("invalid package kind: {value}")),
     }
+}
+
+/// Rewrite the config's relative paths to sit under `base`.
+///
+/// `None` means "not a service", which leaves the config untouched so a console
+/// run keeps resolving against its own working directory.
+fn anchor_relative_paths(cfg: &mut Config, base: Option<&Path>) {
+    let Some(base) = base else {
+        return;
+    };
+
+    cfg.storage.db_path = service::anchor_to(base, Path::new(&cfg.storage.db_path))
+        .to_string_lossy()
+        .into_owned();
+    cfg.web.dir = service::anchor_to(base, Path::new(&cfg.web.dir))
+        .to_string_lossy()
+        .into_owned();
 }
 
 async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Result<()> {
@@ -285,6 +375,21 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
         state.write().await.restore_alerts(restored_alerts);
     }
 
+    // Bind every listening socket before anything is spawned. A port that is
+    // already taken has to fail startup, not surface later as a log line while
+    // the process claims to be running: a service that dies right after
+    // `sc.exe start` returned success leaves the operator with nothing to go on.
+    let gossip_socket = GossipService::bind_socket(&cfg.network).await?;
+    let api_listener = if cfg.api.enabled {
+        Some(api::bind_listener(&cfg.api.bind_addr, cfg.api.port).await?)
+    } else {
+        None
+    };
+
+    // The ports are held, so the node is genuinely up. A service reports
+    // RUNNING only now, which makes `sc.exe start` fail on a bad config.
+    service::report_ready();
+
     // Clone for tasks
     let cfg = Arc::new(cfg);
     let alerts_config = cfg.alerts.clone();
@@ -336,16 +441,16 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
     let gossip_cfg = cfg.network.clone();
     let gossip_db = Arc::clone(&db);
     tokio::spawn(async move {
-        if let Err(e) = GossipService::run_with_rx(gossip_state, gossip_cfg, gossip_db).await {
+        if let Err(e) =
+            GossipService::run_with_socket(gossip_state, gossip_cfg, gossip_db, gossip_socket).await
+        {
             error!("Gossip service error: {}", e);
         }
     });
 
     // Task 3: API server
-    if cfg.api.enabled {
+    if let Some(api_listener) = api_listener {
         let api_state = Arc::clone(&state);
-        let api_bind = cfg.api.bind_addr.clone();
-        let api_port = cfg.api.port;
         let api_web_dir = web_dir.clone();
         let api_upgrade = upgrade_manager.clone();
         let api_upgrade_config = cfg.upgrade.clone();
@@ -368,8 +473,7 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
                 api_notify,
                 api_auth,
                 alert_history_minutes,
-                &api_bind,
-                api_port,
+                api_listener,
                 api_web_dir,
             )
             .await
@@ -404,7 +508,12 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
         info!("os-watcher running. Press Ctrl+C to stop.");
         info!("Use '--tui' flag to start the terminal dashboard.");
         info!("API: http://{}/api/v1/metrics", api_addr);
-        tokio::signal::ctrl_c().await?;
+        // A service never sees Ctrl+C: the SCM signals a stop instead, and the
+        // handler that received it is waiting on this future.
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            () = service::stopped() => {}
+        }
         info!("Shutting down...");
     }
 
@@ -506,5 +615,38 @@ mod tests {
         };
 
         assert_eq!(resolve_api_addr(&cfg, "192.168.1.20"), "10.0.0.5:7980");
+    }
+
+    /// The released configs use `db_path = "os-watcher.db"` and `web.dir =
+    /// "web-dist"`. Under a service those must land in the install directory
+    /// rather than `System32`.
+    #[test]
+    fn service_mode_anchors_relative_paths_to_the_install_directory() {
+        let mut cfg = Config::default();
+        cfg.storage.db_path = "os-watcher.db".to_string();
+        cfg.web.dir = "web-dist".to_string();
+
+        anchor_relative_paths(&mut cfg, Some(Path::new(r"C:\Program Files\os-watcher")));
+
+        assert_eq!(
+            cfg.storage.db_path,
+            r"C:\Program Files\os-watcher\os-watcher.db"
+        );
+        assert_eq!(cfg.web.dir, r"C:\Program Files\os-watcher\web-dist");
+    }
+
+    /// A console run is untouched, and an operator's absolute paths survive
+    /// either way.
+    #[test]
+    fn console_mode_and_absolute_paths_are_left_alone() {
+        let mut cfg = Config::default();
+        cfg.storage.db_path = "os-watcher.db".to_string();
+
+        anchor_relative_paths(&mut cfg, None);
+        assert_eq!(cfg.storage.db_path, "os-watcher.db");
+
+        cfg.storage.db_path = r"D:\data\os-watcher.db".to_string();
+        anchor_relative_paths(&mut cfg, Some(Path::new(r"C:\Program Files\os-watcher")));
+        assert_eq!(cfg.storage.db_path, r"D:\data\os-watcher.db");
     }
 }

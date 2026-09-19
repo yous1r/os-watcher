@@ -120,22 +120,36 @@ fn ignore_udp_conn_reset(_socket: &UdpSocket) -> std::io::Result<()> {
 pub struct GossipService;
 
 impl GossipService {
-    /// Run with an explicit receiver channel
-    pub async fn run_with_rx(
-        state: SharedState,
-        config: NetworkConfig,
-        db: Arc<Database>,
-    ) -> Result<()> {
+    /// Bind the receive socket without starting the loops.
+    ///
+    /// Separate from [`Self::run_with_rx`] so a caller can prove the port is
+    /// actually held before it reports the node as up: the socket is only bound
+    /// inside the spawned task, so a bind failure would otherwise surface long
+    /// after startup looked successful.
+    pub async fn bind_socket(config: &NetworkConfig) -> Result<UdpSocket> {
         let bind_addr = format!("{}:{}", config.bind_addr, config.gossip_port);
-        let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
+        let socket = UdpSocket::bind(&bind_addr).await?;
         socket.set_broadcast(true)?;
         // Only the receive path surfaces the synthetic reset, so this is the one
         // socket that needs it.
         if let Err(e) = ignore_udp_conn_reset(&socket) {
             warn!("Failed to disable UDP connection-reset reporting: {}", e);
         }
-
         info!("Gossip service listening on {}", bind_addr);
+        Ok(socket)
+    }
+
+    /// Run on a socket the caller already bound.
+    ///
+    /// The caller binds first so a taken gossip port fails startup instead of
+    /// being logged from inside the spawned task.
+    pub async fn run_with_socket(
+        state: SharedState,
+        config: NetworkConfig,
+        db: Arc<Database>,
+        socket: UdpSocket,
+    ) -> Result<()> {
+        let socket = Arc::new(socket);
 
         let (tx, mut rx) = mpsc::channel::<(GossipEnvelope, Option<String>)>(256);
 
