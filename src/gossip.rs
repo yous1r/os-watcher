@@ -70,6 +70,52 @@ pub async fn broadcast_leave(state: &SharedState, config: &NetworkConfig) {
     );
 }
 
+/// Windows surfaces an ICMP port-unreachable from a peer that has stopped
+/// listening as `WSAECONNRESET` on the next receive. A UDP socket is
+/// connectionless, so that error carries no meaning for us, but Windows raises
+/// it once per send toward the dead peer — enough to flood the log while a peer
+/// is away but not yet marked offline.
+///
+/// Clearing `SIO_UDP_CONNRESET` makes the stack drop the reset instead of
+/// reporting it, which is what every other platform does by default.
+#[cfg(target_os = "windows")]
+fn ignore_udp_conn_reset(socket: &UdpSocket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSAIoctl, SIO_UDP_CONNRESET};
+
+    // FALSE: stop reporting connection resets on this socket.
+    let mut disable: u32 = 0;
+    let mut returned: u32 = 0;
+    // SAFETY: `socket` outlives the call, and both buffers match the sizes
+    // passed for them. `lpOverlapped`/`lpCompletionRoutine` are null, which
+    // selects the synchronous form.
+    let rc = unsafe {
+        WSAIoctl(
+            socket.as_raw_socket() as usize,
+            SIO_UDP_CONNRESET,
+            &mut disable as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Other platforms do not synthesise receive errors from ICMP, so there is
+/// nothing to suppress.
+#[cfg(not(target_os = "windows"))]
+fn ignore_udp_conn_reset(_socket: &UdpSocket) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Namespace for gossip service associated functions.
 pub struct GossipService;
 
@@ -83,6 +129,11 @@ impl GossipService {
         let bind_addr = format!("{}:{}", config.bind_addr, config.gossip_port);
         let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
         socket.set_broadcast(true)?;
+        // Only the receive path surfaces the synthetic reset, so this is the one
+        // socket that needs it.
+        if let Err(e) = ignore_udp_conn_reset(&socket) {
+            warn!("Failed to disable UDP connection-reset reporting: {}", e);
+        }
 
         info!("Gossip service listening on {}", bind_addr);
 
@@ -544,6 +595,44 @@ mod tests {
             Arc::clone(db),
         )
         .await;
+    }
+
+    /// A peer that stops listening makes the stack answer our datagram with
+    /// ICMP port-unreachable. Windows turns that into a socket error on the next
+    /// receive, which the gossip loop would log once per send while the peer is
+    /// away but not yet marked offline. The receive socket must swallow it.
+    ///
+    /// Windows-only: the error is a Windows behaviour, and on other platforms
+    /// the call is a no-op that this test would not exercise.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn receive_socket_ignores_icmp_port_unreachable() {
+        // Port 1 on loopback: nothing is listening, so the datagram draws ICMP.
+        const DEAD_PEER: &str = "127.0.0.1:1";
+
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("socket should bind");
+        ignore_udp_conn_reset(&socket).expect("resets should be suppressible");
+        socket
+            .send_to(b"probe", DEAD_PEER)
+            .await
+            .expect("datagram should be sent");
+
+        // Give the stack time to deliver the resulting ICMP error to the socket.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let mut buf = [0u8; 64];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            socket.recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            !matches!(outcome, Ok(Err(_))),
+            "a socket error here is the spurious reset this exists to suppress: {:?}",
+            outcome.map(|r| r.map(|(len, src)| (len, src)))
+        );
     }
 
     /// A node re-broadcasts its current sample every gossip tick. Re-storing and

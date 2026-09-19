@@ -83,6 +83,17 @@ codegen-units = 1
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["user"] }
 
+# WSAIoctl(SIO_UDP_CONNRESET) — see ignore_udp_conn_reset() in gossip.rs.
+# Windows reports ICMP port-unreachable from a peer that has gone away as
+# WSAECONNRESET on the next receive, which is meaningless for a connectionless
+# socket and floods the log once a peer stops listening.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio-tungstenite = "0.24"
