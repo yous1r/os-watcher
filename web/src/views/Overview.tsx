@@ -213,7 +213,14 @@ export function Overview(props: {
                   </div>
                   <div class="node-version">
                     <span>版本 {snap.info.version}</span>
-                    <Show when={updateAvailable(snap)}>
+                    <Show
+                      when={updateAvailable(snap)}
+                      fallback={
+                        <Show when={latestVersion()}>
+                          <span class="node-version-latest">已是最新</span>
+                        </Show>
+                      }
+                    >
                       <span class="node-version-new">→ {latestVersion()}</span>
                     </Show>
                   </div>

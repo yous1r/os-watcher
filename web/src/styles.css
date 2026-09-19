@@ -316,6 +316,11 @@ body {
   font-weight: 600;
 }
 
+.node-version-latest {
+  color: var(--ok);
+  font-weight: 600;
+}
+
 .node-name {
   font-weight: 600;
   font-size: 15.5px;

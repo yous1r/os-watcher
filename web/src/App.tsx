@@ -140,6 +140,22 @@ export default function App() {
             {alertCount()} 告警
           </span>
           <span class="sep">|</span>
+          {/* 升级成功后更新提示会消失，这个时间戳是「检测循环仍在推进」的唯一信号。 */}
+          <span
+            title={
+              versionInfo()?.checked_at
+                ? `本机上次检测新版本：${versionInfo()?.checked_at}`
+                : "本机尚未完成过一次新版本检测"
+            }
+          >
+            <Show
+              when={versionInfo()?.checked_at}
+              fallback={<>版本检测 尚未检测</>}
+            >
+              {(checkedAt) => <>版本检测 {formatTime(checkedAt())}</>}
+            </Show>
+          </span>
+          <span class="sep">|</span>
           <span>{lastUpdate()}</span>
           <Show when={authRequired()}>
             <span class="sep">|</span>
