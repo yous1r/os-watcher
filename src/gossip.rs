@@ -1,10 +1,10 @@
+use anyhow::Result;
+use chrono::Utc;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use chrono::Utc;
-use tracing::{info, warn, error, debug};
-use anyhow::Result;
+use tracing::{debug, error, info, warn};
 
 use crate::config::NetworkConfig;
 use crate::state::SharedState;
@@ -64,7 +64,10 @@ pub async fn broadcast_leave(state: &SharedState, config: &NetworkConfig) {
         let _ = socket.send_to(&data, &broadcast_addr).await;
     }
 
-    info!("NodeLeave broadcast sent ({} known peers)", peer_addrs.len());
+    info!(
+        "NodeLeave broadcast sent ({} known peers)",
+        peer_addrs.len()
+    );
 }
 
 /// Namespace for gossip service associated functions.
@@ -120,8 +123,17 @@ impl GossipService {
             loop {
                 match recv_socket.recv_from(&mut buf).await {
                     Ok((len, src)) => {
-                        if let Ok(envelope) = serde_json::from_slice::<GossipEnvelope>(&buf[..len]) {
-                            Self::handle_message(&recv_state, envelope, src, &recv_tx, max_hops, Arc::clone(&recv_db)).await;
+                        if let Ok(envelope) = serde_json::from_slice::<GossipEnvelope>(&buf[..len])
+                        {
+                            Self::handle_message(
+                                &recv_state,
+                                envelope,
+                                src,
+                                &recv_tx,
+                                max_hops,
+                                Arc::clone(&recv_db),
+                            )
+                            .await;
                         }
                     }
                     Err(e) => {
@@ -136,9 +148,8 @@ impl GossipService {
         let ann_tx = tx.clone();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(
-                tokio::time::Duration::from_secs(announce_interval_secs)
-            );
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(announce_interval_secs));
             // Announce immediately on start
             interval.tick().await;
             loop {
@@ -179,9 +190,8 @@ impl GossipService {
         tokio::spawn(async move {
             // Tick immediately so we push metrics as soon as there's something
             // to send, rather than waiting the full interval.
-            let mut interval = tokio::time::interval(
-                tokio::time::Duration::from_secs(gossip_interval_secs)
-            );
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(gossip_interval_secs));
             loop {
                 interval.tick().await;
                 let (node_id, metrics, peer_addrs) = {
@@ -217,7 +227,9 @@ impl GossipService {
                 interval.tick().await;
                 let mut s = cleanup_state.write().await;
                 let local_id = s.local_node.id;
-                let stale: Vec<NodeId> = s.peers.keys()
+                let stale: Vec<NodeId> = s
+                    .peers
+                    .keys()
                     .filter(|&&id| id != local_id)
                     .filter(|id| s.is_stale(id, 120))
                     .cloned()
@@ -274,12 +286,18 @@ impl GossipService {
                         let port = parts[0];
                         if host == "0.0.0.0" || host == "::" {
                             info.gossip_addr = format!("{}:{}", src.ip(), port);
-                            debug!("Rewrote gossip_addr for {} to {}", info.hostname, info.gossip_addr);
+                            debug!(
+                                "Rewrote gossip_addr for {} to {}",
+                                info.hostname, info.gossip_addr
+                            );
                         }
                     }
                 }
 
-                debug!("Received announce from node {} ({})", info.hostname, info.id);
+                debug!(
+                    "Received announce from node {} ({})",
+                    info.hostname, info.id
+                );
 
                 let should_sync = {
                     let s = state.read().await;
@@ -318,7 +336,21 @@ impl GossipService {
             }
 
             GossipMessage::MetricsUpdate { node_id, metrics } => {
-                debug!("Received metrics from node {}", node_id);
+                // The owner of a sample re-broadcasts its current one on every
+                // gossip tick, and a node that already has it must not persist or
+                // forward it again: forwarding turned every sample into one row
+                // per node in the mesh (31x on a live install), and re-forwarding
+                // an unchanged sample made it echo until `max_hops` ran out.
+                let is_new_sample = {
+                    let s = state.read().await;
+                    s.metrics
+                        .get(&node_id)
+                        .is_none_or(|known| known.timestamp != metrics.timestamp)
+                };
+                if !is_new_sample {
+                    return;
+                }
+
                 {
                     let mut s = state.write().await;
                     // Update last_seen for the node
@@ -335,7 +367,11 @@ impl GossipService {
                     let metrics_clone = *metrics.clone();
                     tokio::spawn(async move {
                         if let Err(e) = db_clone.store_metrics(&node_id, &metrics_clone).await {
-                            tracing::warn!("Failed to persist remote metrics for {}: {}", node_id, e);
+                            tracing::warn!(
+                                "Failed to persist remote metrics for {}: {}",
+                                node_id,
+                                e
+                            );
                         }
                     });
                 }
@@ -363,7 +399,10 @@ impl GossipService {
             GossipMessage::Ping { from } => {
                 let local_id = state.read().await.local_node.id;
                 let pong = GossipEnvelope {
-                    message: GossipMessage::Pong { from: local_id, to: from },
+                    message: GossipMessage::Pong {
+                        from: local_id,
+                        to: from,
+                    },
                     hops: 0,
                     max_hops,
                     msg_id: uuid::Uuid::new_v4(),
@@ -403,7 +442,11 @@ impl GossipService {
                 let _ = tx.send((response, Some(src.to_string()))).await;
             }
 
-            GossipMessage::SyncResponse { from, nodes, metrics } => {
+            GossipMessage::SyncResponse {
+                from,
+                nodes,
+                metrics,
+            } => {
                 debug!("Sync response from {}, {} nodes", from, nodes.len());
                 let mut s = state.write().await;
                 let local_id = s.local_node.id;
@@ -425,5 +468,140 @@ impl GossipService {
                 }
             }
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::new_shared_state;
+    use crate::storage::Database;
+    use crate::types::{CpuMetrics, MemoryMetrics, NodeInfo, NodeStatus, SystemMetrics};
+    use chrono::Utc;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    fn node(name: &str) -> NodeInfo {
+        NodeInfo {
+            id: Uuid::new_v4(),
+            hostname: name.to_string(),
+            api_addr: "127.0.0.1:7980".to_string(),
+            gossip_addr: "127.0.0.1:7979".to_string(),
+            status: NodeStatus::Online,
+            last_seen: Utc::now(),
+            version: "0.1.0".to_string(),
+        }
+    }
+
+    fn sample(at: chrono::DateTime<Utc>) -> SystemMetrics {
+        SystemMetrics {
+            timestamp: at,
+            cpu: CpuMetrics {
+                usage_percent: 10.0,
+                core_usages: vec![10.0],
+                core_count: 1,
+            },
+            memory: MemoryMetrics {
+                total_bytes: 1024,
+                used_bytes: 128,
+                available_bytes: 896,
+                usage_percent: 12.5,
+                swap_total_bytes: 0,
+                swap_used_bytes: 0,
+            },
+            disks: vec![],
+            physical_disks: vec![],
+            networks: vec![],
+            load_average: None,
+            top_processes: vec![],
+            uptime_seconds: 1,
+            os_name: "test".to_string(),
+            hostname: "peer".to_string(),
+        }
+    }
+
+    async fn update(
+        state: &SharedState,
+        db: &Arc<Database>,
+        tx: &mpsc::Sender<(GossipEnvelope, Option<String>)>,
+        node_id: NodeId,
+        metrics: SystemMetrics,
+        hops: u8,
+    ) {
+        GossipService::handle_message(
+            state,
+            GossipEnvelope {
+                message: GossipMessage::MetricsUpdate {
+                    node_id,
+                    metrics: Box::new(metrics),
+                },
+                hops,
+                max_hops: 3,
+                msg_id: Uuid::new_v4(),
+            },
+            "127.0.0.1:1234".parse().unwrap(),
+            tx,
+            3,
+            Arc::clone(db),
+        )
+        .await;
+    }
+
+    /// A node re-broadcasts its current sample every gossip tick. Re-storing and
+    /// re-forwarding it is what turned one sample into a row per node in the mesh
+    /// and made it echo until `max_hops` ran out.
+    #[tokio::test]
+    async fn a_rebroadcast_sample_is_not_stored_or_forwarded_again() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Arc::new(
+            Database::new(dir.path().join("history.db").to_str().unwrap())
+                .await
+                .expect("database should initialize"),
+        );
+        let state = new_shared_state(node("local"));
+        let peer = node("peer");
+        let peer_id = peer.id;
+        {
+            let mut s = state.write().await;
+            s.upsert_peer(peer);
+            // A second peer means a fresh sample has somewhere to be forwarded.
+            s.upsert_peer(node("other"));
+        }
+        let (tx, mut rx) = mpsc::channel(16);
+        let first = sample(Utc::now());
+
+        update(&state, &db, &tx, peer_id, first.clone(), 0).await;
+        let forwarded_first = rx.try_recv().is_ok();
+        assert!(forwarded_first, "a new sample must reach the other peers");
+
+        // The same sample again, as the owner re-broadcasts it.
+        update(&state, &db, &tx, peer_id, first.clone(), 0).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a sample already held must not be forwarded again"
+        );
+
+        // Persistence is spawned so the receive loop is not blocked, so wait for
+        // the write instead of racing it.
+        let mut stored = Vec::new();
+        for _ in 0..100 {
+            stored = db
+                .get_recent_metrics(&peer_id, 10)
+                .await
+                .expect("history should be readable");
+            if !stored.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            stored.len(),
+            1,
+            "a repeated sample must occupy a single row"
+        );
+
+        // A genuinely newer sample is still accepted and forwarded.
+        let newer = sample(Utc::now() + chrono::Duration::seconds(5));
+        update(&state, &db, &tx, peer_id, newer, 0).await;
+        assert!(rx.try_recv().is_ok(), "a new sample must be forwarded");
     }
 }

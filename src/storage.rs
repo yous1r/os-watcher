@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use std::time::Duration;
-use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -35,11 +35,29 @@ impl Database {
             .max_connections(5)
             .idle_timeout(Duration::from_secs(30))
             .acquire_timeout(Duration::from_secs(5))
+            // `PRAGMA max_page_count` lives on the connection, not in the file, so
+            // setting it once at startup left the other pooled connections — the
+            // ones every insert runs on — unlimited and the file grew without
+            // bound. Apply it to each connection as it is opened.
+            .after_connect(move |connection, _meta| {
+                Box::pin(async move {
+                    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+                        .fetch_one(&mut *connection)
+                        .await?;
+                    let max_pages = (max_bytes / (page_size.max(1) as u64)).max(1);
+                    sqlx::query(&format!("PRAGMA max_page_count = {max_pages}"))
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect(&url)
             .await?;
         let db = Self { pool, max_bytes };
         db.run_migrations().await?;
+        db.migrate_metrics_dedup().await?;
         db.enforce_capacity().await?;
+        db.log_page_stats("startup").await;
         info!("Database initialized at {}", db_path);
         Ok(db)
     }
@@ -55,12 +73,15 @@ impl Database {
                     .fetch_all(&self.pool)
                     .await?;
             if !columns.iter().any(|(name,)| name == "hostname") {
-                sqlx::query("DROP TABLE alerts_log").execute(&self.pool).await?;
+                sqlx::query("DROP TABLE alerts_log")
+                    .execute(&self.pool)
+                    .await?;
                 warn!("Rebuilt alerts_log with the extended alert schema");
             }
         }
 
-        sqlx::query(r#"
+        sqlx::query(
+            r#"
             CREATE TABLE IF NOT EXISTS metrics_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 node_id TEXT NOT NULL,
@@ -95,7 +116,8 @@ impl Database {
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                 last_sent_at TEXT, last_error TEXT
             );
-        "#)
+        "#,
+        )
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -103,72 +125,170 @@ impl Database {
 
     async fn page_stats(&self) -> Result<(u64, u64, u64)> {
         let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
-            .fetch_one(&self.pool).await?;
+            .fetch_one(&self.pool)
+            .await?;
         let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
-            .fetch_one(&self.pool).await?;
+            .fetch_one(&self.pool)
+            .await?;
         let freelist_count: i64 = sqlx::query_scalar("PRAGMA freelist_count")
-            .fetch_one(&self.pool).await?;
+            .fetch_one(&self.pool)
+            .await?;
         Ok((page_size as u64, page_count as u64, freelist_count as u64))
     }
 
-    async fn set_max_page_count(&self, page_size: u64) -> Result<()> {
-        let max_pages = (self.max_bytes / page_size).max(1);
-        let actual: i64 = sqlx::query_scalar(&format!("PRAGMA max_page_count = {max_pages}"))
-            .fetch_one(&self.pool).await?;
-        if actual as u64 > max_pages {
-            return Err(anyhow!("SQLite max_page_count exceeds configured limit"));
+    /// Bytes the file will occupy once free pages are reclaimed.
+    async fn live_bytes(&self) -> Result<u64> {
+        let (page_size, page_count, freelist) = self.page_stats().await?;
+        Ok(page_size.saturating_mul(page_count.saturating_sub(freelist)))
+    }
+
+    /// Report the size that decides eviction, so an over-limit database is
+    /// visible in the log instead of only in the file size.
+    async fn log_page_stats(&self, reason: &str) {
+        match self.page_stats().await {
+            Ok((page_size, page_count, freelist)) => {
+                let file_bytes = page_size.saturating_mul(page_count);
+                let live = page_size.saturating_mul(page_count.saturating_sub(freelist));
+                info!(
+                    "Database size ({reason}): {:.1} MiB live, {:.1} MiB file, limit {:.1} MiB",
+                    live as f64 / (1024.0 * 1024.0),
+                    file_bytes as f64 / (1024.0 * 1024.0),
+                    self.max_bytes as f64 / (1024.0 * 1024.0),
+                );
+            }
+            Err(error) => warn!("Failed to read database size ({reason}): {error}"),
         }
+    }
+
+    /// Collapse the duplicate metric rows an earlier build stored, then prevent
+    /// them from coming back.
+    ///
+    /// Every node gossiped its current sample every `gossip_interval_secs` and
+    /// each receiver appended a row, so one logical sample was stored once per
+    /// node in the mesh (31x on a live install). `metrics_history` has no reader
+    /// — the panel serves metrics from memory — so the duplicates carry no
+    /// information; the unique index makes `store_metrics` idempotent per
+    /// `(node_id, timestamp)`.
+    async fn migrate_metrics_dedup(&self) -> Result<()> {
+        // Guarding on the index keeps the scan one-time: once it exists no
+        // duplicates can be written, and every later startup skips the work.
+        let exists: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_metrics_unique_sample'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        if exists.is_some() {
+            return Ok(());
+        }
+
+        let duplicates: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM metrics_history
+             WHERE id NOT IN (SELECT MIN(id) FROM metrics_history GROUP BY node_id, timestamp)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if duplicates > 0 {
+            sqlx::query(
+                "DELETE FROM metrics_history
+                 WHERE id NOT IN (SELECT MIN(id) FROM metrics_history GROUP BY node_id, timestamp)",
+            )
+            .execute(&self.pool)
+            .await?;
+            info!("Removed {duplicates} duplicate metric records");
+        }
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_metrics_unique_sample
+             ON metrics_history(node_id, timestamp)",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
-    async fn enforce_capacity(&self) -> Result<()> {
+    /// Bring the database back under the configured limit.
+    ///
+    /// Called at startup and hourly. There are two things to reclaim, and the
+    /// trigger differs for each:
+    ///
+    /// - Too many live rows: evict the oldest until the live data fits the target.
+    /// - A file larger than its live data: deletes and evictions only free pages,
+    ///   so the file stays at whatever peak it reached until it is rewritten.
+    ///   This is the case that matters in practice, because the per-connection
+    ///   page cap keeps the file from ever exceeding the limit outright.
+    pub async fn enforce_capacity(&self) -> Result<()> {
+        let target = self.max_bytes.saturating_mul(SHRINK_TARGET_RATIO) / 100;
         let (page_size, page_count, freelist) = self.page_stats().await?;
         let file_bytes = page_size.saturating_mul(page_count);
-        if file_bytes > self.max_bytes {
-            let target = self.max_bytes.saturating_mul(SHRINK_TARGET_RATIO) / 100;
-            let mut removed = 0;
-            loop {
-                let (_, pages, free) = self.page_stats().await?;
-                if pages.saturating_sub(free).saturating_mul(page_size) <= target {
-                    break;
-                }
-                let n = self.evict_oldest(EVICTION_BATCH_SIZE).await?;
-                if n == 0 {
-                    break;
-                }
-                removed += n;
-            }
-            sqlx::query("VACUUM").execute(&self.pool).await?;
-            let (new_page_size, pages, _) = self.page_stats().await?;
-            if new_page_size.saturating_mul(pages) > self.max_bytes {
-                return Err(anyhow!("database remains above the {} byte limit after startup shrink", self.max_bytes));
-            }
-            warn!("Shrank over-limit database by removing {} metric records", removed);
-            self.set_max_page_count(new_page_size).await?;
-        } else {
-            self.set_max_page_count(page_size).await?;
+        let has_free_pages_worth_reclaiming = freelist > 0 && file_bytes > target;
+        if self.live_bytes().await? <= target && !has_free_pages_worth_reclaiming {
+            return Ok(());
         }
-        let _ = freelist;
+
+        let mut removed = 0;
+        loop {
+            if self.live_bytes().await? <= target {
+                break;
+            }
+            let n = self.evict_oldest(EVICTION_BATCH_SIZE).await?;
+            if n == 0 {
+                break;
+            }
+            removed += n;
+        }
+
+        let (_, _, freelist) = self.page_stats().await?;
+        if freelist > 0 {
+            sqlx::query("VACUUM").execute(&self.pool).await?;
+        }
+        let (page_size, page_count, _) = self.page_stats().await?;
+        let file_bytes = page_size.saturating_mul(page_count);
+        if file_bytes > self.max_bytes {
+            return Err(anyhow!(
+                "database remains above the {} byte limit after enforcement",
+                self.max_bytes
+            ));
+        }
+        if removed > 0 {
+            warn!("Shrank over-limit database by removing {removed} metric records");
+        } else {
+            info!("Compacted over-limit database");
+        }
         Ok(())
     }
-
     async fn evict_oldest(&self, limit: i64) -> Result<u64> {
         let result = sqlx::query("DELETE FROM metrics_history WHERE id IN (SELECT id FROM metrics_history ORDER BY timestamp ASC, id ASC LIMIT ?)")
             .bind(limit).execute(&self.pool).await?;
         Ok(result.rows_affected())
     }
 
-    async fn insert_metrics(&self, node_id: &NodeId, metrics: &SystemMetrics, raw: &str) -> sqlx::Result<()> {
-        sqlx::query(r#"INSERT INTO metrics_history
+    async fn insert_metrics(
+        &self,
+        node_id: &NodeId,
+        metrics: &SystemMetrics,
+        raw: &str,
+    ) -> sqlx::Result<()> {
+        // A node re-sends its current sample on every gossip tick and each peer
+        // appends it, so the same (node_id, timestamp) arrives repeatedly. The
+        // unique index makes the first write win and later ones no-ops.
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO metrics_history
             (node_id, hostname, timestamp, cpu_usage, memory_usage,
              memory_used_bytes, memory_total_bytes, uptime_seconds, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#)
-            .bind(node_id.to_string()).bind(&metrics.hostname)
-            .bind(metrics.timestamp.to_rfc3339())
-            .bind(metrics.cpu.usage_percent as f64).bind(metrics.memory.usage_percent as f64)
-            .bind(metrics.memory.used_bytes as i64).bind(metrics.memory.total_bytes as i64)
-            .bind(metrics.uptime_seconds as i64).bind(raw).execute(&self.pool).await
-            .map(|_| ())
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(node_id.to_string())
+        .bind(&metrics.hostname)
+        .bind(metrics.timestamp.to_rfc3339())
+        .bind(metrics.cpu.usage_percent as f64)
+        .bind(metrics.memory.usage_percent as f64)
+        .bind(metrics.memory.used_bytes as i64)
+        .bind(metrics.memory.total_bytes as i64)
+        .bind(metrics.uptime_seconds as i64)
+        .bind(raw)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
     }
 
     pub async fn store_metrics(&self, node_id: &NodeId, metrics: &SystemMetrics) -> Result<()> {
@@ -181,7 +301,10 @@ impl Database {
                     if removed == 0 {
                         return Err(anyhow!(error));
                     }
-                    warn!("Database reached capacity; evicted {} oldest metric records", removed);
+                    warn!(
+                        "Database reached capacity; evicted {} oldest metric records",
+                        removed
+                    );
                 }
                 Err(error) => return Err(anyhow!(error)),
             }
@@ -196,18 +319,21 @@ impl Database {
     ) -> Result<Vec<SystemMetrics>> {
         let node_id_str = node_id.to_string();
 
-        let rows: Vec<(String,)> = sqlx::query_as(r#"
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"
             SELECT raw_json FROM metrics_history
             WHERE node_id = ?
             ORDER BY timestamp DESC
             LIMIT ?
-        "#)
+        "#,
+        )
         .bind(&node_id_str)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
-        let metrics: Vec<SystemMetrics> = rows.iter()
+        let metrics: Vec<SystemMetrics> = rows
+            .iter()
             .filter_map(|(raw,)| serde_json::from_str(raw).ok())
             .collect();
 
@@ -216,12 +342,14 @@ impl Database {
 
     /// Persist a newly triggered (or restored) alert.
     pub async fn store_alert(&self, alert: &Alert) -> Result<()> {
-        sqlx::query(r#"
+        sqlx::query(
+            r#"
             INSERT OR REPLACE INTO alerts_log
                 (id, node_id, hostname, rule_name, metric, target, operator, severity,
                  message, value, threshold, triggered_at, resolved_at, resolved_reason)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#)
+        "#,
+        )
         .bind(alert.id.to_string())
         .bind(alert.node_id.to_string())
         .bind(&alert.hostname)
@@ -290,12 +418,11 @@ impl Database {
     /// restart even though the in-memory copy was pruned.
     pub async fn purge_resolved_alerts(&self, cutoff: DateTime<Utc>) -> Result<u64> {
         let cutoff_str = cutoff.to_rfc3339();
-        let result = sqlx::query(
-            "DELETE FROM alerts_log WHERE resolved_at IS NOT NULL AND resolved_at < ?",
-        )
-        .bind(&cutoff_str)
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("DELETE FROM alerts_log WHERE resolved_at IS NOT NULL AND resolved_at < ?")
+                .bind(&cutoff_str)
+                .execute(&self.pool)
+                .await?;
 
         Ok(result.rows_affected())
     }
@@ -303,37 +430,39 @@ impl Database {
     /// All configured push channels, oldest first.
     pub async fn list_notify_channels(&self) -> Result<Vec<NotifyChannel>> {
         let rows: Vec<ChannelRow> = sqlx::query_as(
-                "SELECT id, name, enabled, min_severity, config_json, created_at, updated_at,
+            "SELECT id, name, enabled, min_severity, config_json, created_at, updated_at,
                         last_sent_at, last_error
                  FROM notify_channels ORDER BY created_at ASC",
-            )
-            .fetch_all(&self.pool)
-            .await?;
+        )
+        .fetch_all(&self.pool)
+        .await?;
 
         Ok(rows.into_iter().filter_map(channel_from_row).collect())
     }
 
     pub async fn get_notify_channel(&self, id: &Uuid) -> Result<Option<NotifyChannel>> {
         let row: Option<ChannelRow> = sqlx::query_as(
-                "SELECT id, name, enabled, min_severity, config_json, created_at, updated_at,
+            "SELECT id, name, enabled, min_severity, config_json, created_at, updated_at,
                         last_sent_at, last_error
                  FROM notify_channels WHERE id = ?",
-            )
-            .bind(id.to_string())
-            .fetch_optional(&self.pool)
-            .await?;
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
 
         Ok(row.and_then(channel_from_row))
     }
 
     pub async fn upsert_notify_channel(&self, channel: &NotifyChannel) -> Result<()> {
         let config_json = serde_json::to_string(&channel.config)?;
-        sqlx::query(r#"
+        sqlx::query(
+            r#"
             INSERT OR REPLACE INTO notify_channels
                 (id, name, enabled, min_severity, config_json, created_at, updated_at,
                  last_sent_at, last_error)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#)
+        "#,
+        )
         .bind(channel.id.to_string())
         .bind(&channel.name)
         .bind(channel.enabled as i64)
@@ -363,11 +492,13 @@ impl Database {
     pub async fn record_notify_result(&self, id: &Uuid, error: Option<&str>) -> Result<()> {
         match error {
             None => {
-                sqlx::query("UPDATE notify_channels SET last_sent_at = ?, last_error = NULL WHERE id = ?")
-                    .bind(Utc::now().to_rfc3339())
-                    .bind(id.to_string())
-                    .execute(&self.pool)
-                    .await?;
+                sqlx::query(
+                    "UPDATE notify_channels SET last_sent_at = ?, last_error = NULL WHERE id = ?",
+                )
+                .bind(Utc::now().to_rfc3339())
+                .bind(id.to_string())
+                .execute(&self.pool)
+                .await?;
             }
             Some(message) => {
                 let truncated: String = message.chars().take(500).collect();
@@ -383,22 +514,23 @@ impl Database {
 
     /// Whether a table exists in the schema.
     async fn table_exists(&self, name: &str) -> Result<bool> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.is_some())
     }
 
     /// Upsert node info
     pub async fn upsert_node(&self, node: &NodeInfo) -> Result<()> {
-        sqlx::query(r#"
+        sqlx::query(
+            r#"
             INSERT OR REPLACE INTO nodes_seen
                 (id, hostname, api_addr, gossip_addr, last_seen, version)
             VALUES (?, ?, ?, ?, ?, ?)
-        "#)
+        "#,
+        )
         .bind(node.id.to_string())
         .bind(&node.hostname)
         .bind(&node.api_addr)
@@ -416,9 +548,11 @@ impl Database {
         let cutoff = Utc::now() - chrono::Duration::hours(retention_hours as i64);
         let cutoff_str = cutoff.to_rfc3339();
 
-        let result = sqlx::query(r#"
+        let result = sqlx::query(
+            r#"
             DELETE FROM metrics_history WHERE timestamp < ?
-        "#)
+        "#,
+        )
         .bind(&cutoff_str)
         .execute(&self.pool)
         .await?;
@@ -495,8 +629,17 @@ fn alert_from_row(row: AlertRow) -> Option<Alert> {
 }
 
 fn channel_from_row(row: ChannelRow) -> Option<NotifyChannel> {
-    let (id, name, enabled, min_severity, config_json, created_at, updated_at, last_sent_at, last_error) =
-        row;
+    let (
+        id,
+        name,
+        enabled,
+        min_severity,
+        config_json,
+        created_at,
+        updated_at,
+        last_sent_at,
+        last_error,
+    ) = row;
 
     let config: ChannelConfig = serde_json::from_str(&config_json).ok()?;
 
@@ -589,49 +732,198 @@ mod tests {
     fn metrics(timestamp: chrono::DateTime<Utc>, payload_size: usize) -> SystemMetrics {
         SystemMetrics {
             timestamp,
-            cpu: CpuMetrics { usage_percent: 10.0, core_usages: vec![10.0], core_count: 1 },
-            memory: MemoryMetrics {
-                total_bytes: 1024, used_bytes: 128, available_bytes: 896,
-                usage_percent: 12.5, swap_total_bytes: 0, swap_used_bytes: 0,
+            cpu: CpuMetrics {
+                usage_percent: 10.0,
+                core_usages: vec![10.0],
+                core_count: 1,
             },
-            disks: vec![], physical_disks: vec![], networks: vec![], load_average: None,
+            memory: MemoryMetrics {
+                total_bytes: 1024,
+                used_bytes: 128,
+                available_bytes: 896,
+                usage_percent: 12.5,
+                swap_total_bytes: 0,
+                swap_used_bytes: 0,
+            },
+            disks: vec![],
+            physical_disks: vec![],
+            networks: vec![],
+            load_average: None,
             top_processes: vec![ProcessInfo {
-                pid: 1, name: "x".repeat(payload_size), cpu_usage: 1.0, memory_bytes: 1,
-                status: "Run".to_string(), disk_read_bps: 0.0, disk_write_bps: 0.0,
+                pid: 1,
+                name: "x".repeat(payload_size),
+                cpu_usage: 1.0,
+                memory_bytes: 1,
+                status: "Run".to_string(),
+                disk_read_bps: 0.0,
+                disk_write_bps: 0.0,
             }],
-            uptime_seconds: 1, os_name: "test".to_string(), hostname: "test".to_string(),
+            uptime_seconds: 1,
+            os_name: "test".to_string(),
+            hostname: "test".to_string(),
         }
     }
 
     async fn history_count(db: &Database) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM metrics_history")
-            .fetch_one(&db.pool).await.expect("count should succeed")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count should succeed")
+    }
+
+    /// The limit lives on the connection, so it has to hold for every pooled
+    /// connection — not just the one startup happened to configure.
+    #[tokio::test]
+    async fn every_pooled_connection_enforces_the_byte_limit() {
+        let dir = tempdir().expect("temp directory should be created");
+        let db =
+            Database::new_with_limit(dir.path().join("history.db").to_str().unwrap(), 64 * 1024)
+                .await
+                .expect("database should initialize");
+
+        let expected = (64 * 1024 / 4096) as i64;
+        for _ in 0..6 {
+            let limit: i64 = sqlx::query_scalar("PRAGMA max_page_count")
+                .fetch_one(&db.pool)
+                .await
+                .expect("max_page_count should be readable");
+            assert_eq!(
+                limit, expected,
+                "a pooled connection without the limit lets the file grow past it"
+            );
+        }
+    }
+
+    /// A sample that arrives twice — the owner re-broadcasts it every gossip
+    /// tick — must occupy one row, not one per receipt.
+    #[tokio::test]
+    async fn repeated_sample_is_stored_once() {
+        let dir = tempdir().expect("temp directory should be created");
+        let db = Database::new_with_limit(
+            dir.path().join("history.db").to_str().unwrap(),
+            8 * 1024 * 1024,
+        )
+        .await
+        .expect("database should initialize");
+        let node_id = Uuid::new_v4();
+        let sample = metrics(Utc::now(), 1_000);
+
+        for _ in 0..31 {
+            db.store_metrics(&node_id, &sample)
+                .await
+                .expect("a repeated sample must not fail the insert");
+        }
+
+        assert_eq!(history_count(&db).await, 1);
+    }
+
+    /// Eviction frees pages but never shrinks the file, so enforcement has to be
+    /// able to compact an over-limit database while it is running.
+    #[tokio::test]
+    async fn runtime_enforcement_compacts_an_over_limit_database() {
+        let dir = tempdir().expect("temp directory should be created");
+        let limit = 128 * 1024;
+        let db = Database::new_with_limit(dir.path().join("history.db").to_str().unwrap(), limit)
+            .await
+            .expect("database should initialize");
+        let node_id = Uuid::new_v4();
+
+        // Fill with rows that have already expired, as a running instance does.
+        for offset in 0..40 {
+            db.store_metrics(
+                &node_id,
+                &metrics(Utc::now() - ChronoDuration::hours(1 + offset), 4_000),
+            )
+            .await
+            .expect("metrics should be stored");
+        }
+        db.cleanup_old_metrics(1)
+            .await
+            .expect("expired rows should be deleted");
+        let (_, pages_before, free_before) = db.page_stats().await.unwrap();
+        assert!(free_before > 0, "deletes should leave free pages behind");
+
+        db.enforce_capacity()
+            .await
+            .expect("enforcement should succeed");
+
+        let (page_size, pages_after, _) = db.page_stats().await.unwrap();
+        assert!(
+            page_size * pages_after < page_size * pages_before,
+            "enforcement must reclaim the space deletes left free"
+        );
+        assert!(page_size * pages_after <= limit);
+    }
+
+    /// The unique index has to exist on databases created before it, otherwise
+    /// the duplicates an older build wrote survive the upgrade.
+    #[tokio::test]
+    async fn migration_collapses_duplicates_from_an_older_database() {
+        let dir = tempdir().expect("temp directory should be created");
+        let path = dir.path().join("history.db");
+        let node_id = Uuid::new_v4();
+        let sample = metrics(Utc::now(), 1_000);
+
+        {
+            let db = Database::new_with_limit(path.to_str().unwrap(), 8 * 1024 * 1024)
+                .await
+                .expect("database should initialize");
+            db.store_metrics(&node_id, &sample)
+                .await
+                .expect("metrics should be stored");
+            // Reproduce the pre-index shape: the same sample stored repeatedly.
+            sqlx::query("DROP INDEX IF EXISTS idx_metrics_unique_sample")
+                .execute(&db.pool)
+                .await
+                .expect("index should be droppable");
+            for _ in 0..4 {
+                sqlx::query("INSERT INTO metrics_history (node_id, hostname, timestamp, cpu_usage, memory_usage, memory_used_bytes, memory_total_bytes, uptime_seconds, raw_json) VALUES (?, ?, ?, 1.0, 1.0, 1, 1, 1, '{}')")
+                    .bind(node_id.to_string())
+                    .bind("host")
+                    .bind(sample.timestamp.to_rfc3339())
+                    .execute(&db.pool)
+                    .await
+                    .expect("duplicate row should be insertable without the index");
+            }
+            assert_eq!(history_count(&db).await, 5);
+        }
+
+        let db = Database::new_with_limit(path.to_str().unwrap(), 8 * 1024 * 1024)
+            .await
+            .expect("reopening should migrate the database");
+
+        assert_eq!(history_count(&db).await, 1);
     }
 
     #[tokio::test]
     async fn capacity_eviction_uses_global_oldest_order() {
         let dir = tempdir().expect("temp directory should be created");
-        let db = Database::new_with_limit(
-            dir.path().join("history.db").to_str().unwrap(),
-            128 * 1024,
-        )
-        .await
-        .expect("database should initialize");
+        let db =
+            Database::new_with_limit(dir.path().join("history.db").to_str().unwrap(), 128 * 1024)
+                .await
+                .expect("database should initialize");
         let node_id = Uuid::new_v4();
         for offset in 0..8 {
-            db.store_metrics(&node_id, &metrics(Utc::now() - ChronoDuration::seconds(8 - offset), 10_000))
-                .await.expect("metrics should be stored");
+            db.store_metrics(
+                &node_id,
+                &metrics(Utc::now() - ChronoDuration::seconds(8 - offset), 10_000),
+            )
+            .await
+            .expect("metrics should be stored");
         }
         let newest = metrics(Utc::now(), 10_000);
-        db.store_metrics(&node_id, &newest).await.expect("latest metrics should be stored after eviction");
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT timestamp FROM metrics_history ORDER BY timestamp ASC, id ASC",
-        )
-            .fetch_all(&db.pool)
+        db.store_metrics(&node_id, &newest)
             .await
-            .expect("history should be readable");
+            .expect("latest metrics should be stored after eviction");
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT timestamp FROM metrics_history ORDER BY timestamp ASC, id ASC")
+                .fetch_all(&db.pool)
+                .await
+                .expect("history should be readable");
         assert!(rows.len() < 9);
-        assert!(rows.iter().any(|(timestamp,)| timestamp == &newest.timestamp.to_rfc3339()));
+        assert!(rows
+            .iter()
+            .any(|(timestamp,)| timestamp == &newest.timestamp.to_rfc3339()));
     }
 
     #[tokio::test]
@@ -641,10 +933,15 @@ mod tests {
         let node_id = Uuid::new_v4();
         {
             let db = Database::new_with_limit(path.to_str().unwrap(), 128 * 1024)
-                .await.expect("database should initialize");
+                .await
+                .expect("database should initialize");
             for offset in 0..12 {
-                db.store_metrics(&node_id, &metrics(Utc::now() - ChronoDuration::seconds(12 - offset), 4_000))
-                    .await.expect("metrics should be stored");
+                db.store_metrics(
+                    &node_id,
+                    &metrics(Utc::now() - ChronoDuration::seconds(12 - offset), 4_000),
+                )
+                .await
+                .expect("metrics should be stored");
             }
             sqlx::query("INSERT INTO nodes_seen (id, hostname, api_addr, gossip_addr, last_seen, version) VALUES (?, ?, ?, ?, ?, ?)")
                 .bind(node_id.to_string()).bind("protected").bind("127.0.0.1:1").bind("127.0.0.1:2")
@@ -652,23 +949,46 @@ mod tests {
                 .expect("protected row should be stored");
         }
         let db = Database::new_with_limit(path.to_str().unwrap(), 128 * 1024)
-            .await.expect("over-limit database should shrink on startup");
+            .await
+            .expect("over-limit database should shrink on startup");
         assert!(history_count(&db).await > 0);
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM nodes_seen WHERE hostname = 'protected'")
-            .fetch_one(&db.pool).await.expect("protected row should remain"), 1);
-        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size").fetch_one(&db.pool).await.unwrap();
-        let page_count: i64 = sqlx::query_scalar("PRAGMA page_count").fetch_one(&db.pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM nodes_seen WHERE hostname = 'protected'"
+            )
+            .fetch_one(&db.pool)
+            .await
+            .expect("protected row should remain"),
+            1
+        );
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert!((page_size * page_count) as u64 <= 128 * 1024);
     }
 
     #[tokio::test]
     async fn cleanup_removes_only_expired_metrics() {
         let dir = tempdir().expect("temp directory should be created");
-        let db = Database::new_with_limit(dir.path().join("history.db").to_str().unwrap(), 128 * 1024)
-            .await.expect("database should initialize");
+        let db =
+            Database::new_with_limit(dir.path().join("history.db").to_str().unwrap(), 128 * 1024)
+                .await
+                .expect("database should initialize");
         let node_id = Uuid::new_v4();
-        db.store_metrics(&node_id, &metrics(Utc::now() - ChronoDuration::hours(2), 100)).await.unwrap();
-        db.store_metrics(&node_id, &metrics(Utc::now(), 100)).await.unwrap();
+        db.store_metrics(
+            &node_id,
+            &metrics(Utc::now() - ChronoDuration::hours(2), 100),
+        )
+        .await
+        .unwrap();
+        db.store_metrics(&node_id, &metrics(Utc::now(), 100))
+            .await
+            .unwrap();
         assert_eq!(db.cleanup_old_metrics(1).await.unwrap(), 1);
         assert_eq!(history_count(&db).await, 1);
     }
@@ -695,8 +1015,10 @@ mod tests {
     #[tokio::test]
     async fn purge_removes_only_expired_resolved_alerts() {
         let dir = tempdir().expect("temp directory should be created");
-        let db = Database::new_with_limit(dir.path().join("alerts.db").to_str().unwrap(), 128 * 1024)
-            .await.expect("database should initialize");
+        let db =
+            Database::new_with_limit(dir.path().join("alerts.db").to_str().unwrap(), 128 * 1024)
+                .await
+                .expect("database should initialize");
 
         let mut expired = alert("expired", None);
         let mut recent = alert("recent", None);
@@ -723,7 +1045,10 @@ mod tests {
                 .await
                 .expect("alerts should be readable");
         assert_eq!(
-            remaining.into_iter().map(|(name,)| name).collect::<Vec<_>>(),
+            remaining
+                .into_iter()
+                .map(|(name,)| name)
+                .collect::<Vec<_>>(),
             vec!["active".to_string(), "recent".to_string()],
             "an unresolved alert must survive the purge"
         );

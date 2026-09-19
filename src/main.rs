@@ -389,6 +389,11 @@ async fn run_agent(cfg: Config, use_tui: bool, web_dir: Option<String>) -> Resul
                 Ok(n) => info!("Cleaned up {} old metric records", n),
                 Err(e) => error!("Cleanup error: {}", e),
             }
+            // Deletes only free pages, so the file keeps whatever peak it reached
+            // until it is compacted. Reclaim the space on the same cadence.
+            if let Err(e) = cleanup_db.enforce_capacity().await {
+                error!("Capacity enforcement error: {}", e);
+            }
         }
     });
 
