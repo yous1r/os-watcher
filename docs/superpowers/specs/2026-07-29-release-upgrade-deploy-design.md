@@ -38,13 +38,13 @@
 
 4. **部署脚本**
    - `deploy.sh` 以脚本所在目录为工作目录。
-   - Linux 要求 root/sudo，Windows 要求管理员 Git Bash/MSYS2。
+   - Linux 要求 root/sudo；Windows 提供 `deploy.ps1`（原生 PowerShell）与 `deploy.cmd`（UAC 自动提权），`deploy.sh` 在 Windows 上把服务注册委派给 `deploy.ps1`。
    - 参数支持 `--package node|full`、`--version`、`--repo`、`--platform`、`--proxy`、端口、peers、服务名等。
    - 自动检测平台，构造 Release 下载 URL，优先用 `curl`，否则用 `wget`。
    - 如果下载到 `.sha256`，使用 `sha256sum` 或 `certutil` 校验。
    - 安装前备份当前二进制、配置和 `web-dist`。
    - Linux 写入 systemd 服务，`WorkingDirectory` 指向部署目录。
-   - Windows 使用 NSSM 注册服务；运行中自升级通过隐藏 PowerShell 进程调用 `sc.exe stop/start` 控制该服务。
+   - Windows 用原生 `sc.exe`/SCM 注册服务（`New-Service` 写入 binPath），二进制自身实现 `StartServiceCtrlDispatcher` 协议，不依赖 NSSM；运行中自升级通过隐藏 PowerShell 进程调用 `sc.exe stop/start` 控制该服务。
 
 ## 后端升级流程
 

@@ -199,6 +199,8 @@ jobs:
           Copy-Item "target\release\os-watcher.exe" "$dist\"
           if (Test-Path README.md) { Copy-Item README.md "$dist\" }
           if (Test-Path deploy.sh) { Copy-Item deploy.sh "$dist\" }
+          if (Test-Path deploy.ps1) { Copy-Item deploy.ps1 "$dist\" }
+          if (Test-Path deploy.cmd) { Copy-Item deploy.cmd "$dist\" }
           Copy-Item config.node.example.toml "$dist\config.example.toml"
           Compress-Archive -Path $dist -DestinationPath "$dist.zip"
           $hash = (Get-FileHash "$dist.zip" -Algorithm SHA256).Hash.ToLower()
@@ -212,6 +214,8 @@ jobs:
           Copy-Item "target\release\os-watcher.exe" "$dist\"
           if (Test-Path README.md) { Copy-Item README.md "$dist\" }
           if (Test-Path deploy.sh) { Copy-Item deploy.sh "$dist\" }
+          if (Test-Path deploy.ps1) { Copy-Item deploy.ps1 "$dist\" }
+          if (Test-Path deploy.cmd) { Copy-Item deploy.cmd "$dist\" }
           Copy-Item config.full.example.toml "$dist\config.example.toml"
           Copy-Item web\dist "$dist\web-dist" -Recurse
           Compress-Archive -Path $dist -DestinationPath "$dist.zip"

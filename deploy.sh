@@ -7,7 +7,8 @@
 #   sudo ./deploy.sh --package full --port 7980 --gossip-port 7979
 #   sudo GITHUB_REPO=yous1r/os-watcher HTTPS_PROXY=http://127.0.0.1:7890 ./deploy.sh --package full
 #
-# Windows 请在「以管理员身份运行」的 Git Bash / MSYS2 中执行。
+# Windows 请在「以管理员身份运行」的 Git Bash / MSYS2 中执行，
+# 或直接运行 deploy.cmd（会自动提权，无需 Git Bash）。
 #
 # 选项：
 #   --package <node|full>      安装包类型，默认 node
@@ -248,14 +249,29 @@ install_payload() {
 
   [[ -f "$root/$bin_name" ]] || fail "Release 包缺少可执行文件：$bin_name"
 
+  # Windows 上运行中的服务占着 exe，覆盖会因共享冲突失败。deploy.ps1 负责
+  # 停止与重新启动服务，这里先停，注册阶段再拉起。
+  if is_windows && command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -Command "
+      \$s = Get-Service -Name '$SERVICE_NAME' -ErrorAction SilentlyContinue
+      if (\$s -and \$s.Status -ne 'Stopped') {
+        Stop-Service -Name '$SERVICE_NAME' -Force
+        \$s.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+      }
+    " || c_warn "停止现有服务失败，继续安装"
+  fi
+
   cp -f "$root/$bin_name" "$SCRIPT_DIR/$bin_name"
   if ! is_windows; then
     chmod 0755 "$SCRIPT_DIR/$bin_name"
   fi
 
-  for item in README.md deploy.sh config.example.toml; do
+  for item in README.md deploy.sh deploy.ps1 deploy.cmd config.example.toml; do
     if [[ -f "$root/$item" ]]; then
-      cp -f "$root/$item" "$SCRIPT_DIR/$item"
+      # Windows 会拒绝覆盖正在被占用的文件（脚本自身就是这种）。这些只是
+      # 附带的脚本与文档，失败不该中断整个安装。
+      cp -f "$root/$item" "$SCRIPT_DIR/$item" ||
+        c_warn "未能更新 $item（文件可能被占用），已跳过"
     fi
   done
 
@@ -307,21 +323,26 @@ EOF
 }
 
 install_windows_service() {
-  local bin_win config_win
-  bin_win="$(to_windows_path "$SCRIPT_DIR/os-watcher.exe")"
-  config_win="$(to_windows_path "$SCRIPT_DIR/config.toml")"
+  local ps1="$SCRIPT_DIR/deploy.ps1"
+  local ps1_win
 
-  if command -v nssm.exe >/dev/null 2>&1; then
-    nssm.exe stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-    nssm.exe remove "$SERVICE_NAME" confirm >/dev/null 2>&1 || true
-    nssm.exe install "$SERVICE_NAME" "$bin_win" --config "$config_win" start --api-port "$API_PORT" --gossip-port "$GOSSIP_PORT" ${PEERS:+--peers "$PEERS"}
-    nssm.exe set "$SERVICE_NAME" AppDirectory "$(to_windows_path "$SCRIPT_DIR")" >/dev/null
-    nssm.exe set "$SERVICE_NAME" Start SERVICE_AUTO_START >/dev/null
-    nssm.exe start "$SERVICE_NAME"
-    c_ok "Windows 服务已通过 NSSM 启动：$SERVICE_NAME"
-  else
-    fail "Windows 自升级依赖可由 sc.exe 管理的服务；请安装 nssm.exe 后重跑脚本"
+  if [[ ! -f "$ps1" ]]; then
+    fail "缺少 deploy.ps1，无法注册 Windows 服务（请从 Release 包重新解压）"
   fi
+
+  if ! command -v powershell.exe >/dev/null 2>&1; then
+    fail "找不到 powershell.exe，无法注册 Windows 服务"
+  fi
+
+  ps1_win="$(to_windows_path "$ps1")"
+
+  # 服务注册与启动全部交给 PowerShell：只有它能把带空格的 binPath 原样写进
+  # 注册表，也才能把 Start-Service 的失败当作失败返回。
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$ps1_win" \
+    -RegisterOnly -Package "$PACKAGE" -ServiceName "$SERVICE_NAME" \
+    -Port "$API_PORT" -GossipPort "$GOSSIP_PORT" \
+    ${PEERS:+-Peers "$PEERS"} ||
+    fail "Windows 服务注册失败：$SERVICE_NAME"
 }
 
 confirm_install() {
