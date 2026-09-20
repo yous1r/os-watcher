@@ -1808,6 +1808,63 @@ mod tests {
         }
     }
 
+    /// The reconciler rewrites `config.toml` after the backup is taken, so a
+    /// later failure has to undo that rewrite exactly. Restoring by name is not
+    /// enough on its own: the file must come back byte for byte, comments and
+    /// line endings included, or a failed upgrade would quietly cost the
+    /// operator the settings the reconciler happened to touch.
+    #[test]
+    fn rollback_restores_the_config_reconciliation_rewrote() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let install_dir = temp.path().join("install");
+        let backup_dir = temp.path().join("backup");
+        let payload_root = temp.path().join("payload");
+        fs::create_dir_all(&install_dir).expect("install dir should be created");
+        fs::create_dir_all(&payload_root).expect("payload dir should be created");
+
+        let current_exe = install_dir.join(canonical_binary_name());
+        fs::write(&current_exe, "old binary").expect("current executable should be written");
+
+        // A node install: CRLF config, an operator comment, no bundle.
+        let original = "[node]\r\n[metrics]\r\n[network]\r\n[api]\r\n[storage]\r\n\r\n\
+                        [web]\r\nenabled = false\r\n\r\n\
+                        [upgrade]\r\npackage = \"node\"  # 运维自己的备注\r\n";
+        fs::write(install_dir.join("config.toml"), original)
+            .expect("installed config should be written");
+        fs::write(payload_root.join(canonical_binary_name()), "new binary")
+            .expect("archive binary should be written");
+        fs::create_dir_all(payload_root.join(WEB_DIST_DIR))
+            .expect("payload bundle should be created");
+        fs::write(payload_root.join(WEB_DIST_DIR).join("index.html"), "<html></html>")
+            .expect("payload asset should be written");
+
+        // The real upgrade order: back up, install, then reconcile.
+        backup_current_install(&current_exe, &install_dir, &backup_dir)
+            .expect("backup should succeed");
+        install_payload(&payload_root, &install_dir, &current_exe).expect("install should succeed");
+        apply_package_layout(&install_dir, &payload_root, PackageKind::Full)
+            .expect("package layout should apply");
+        let switched =
+            fs::read_to_string(install_dir.join("config.toml")).expect("config should be readable");
+        assert_ne!(switched, original, "the switch must have rewritten the config");
+
+        rollback_backup(&backup_dir, &install_dir, &current_exe).expect("rollback should succeed");
+
+        assert_eq!(
+            fs::read_to_string(install_dir.join("config.toml")).expect("config should be restored"),
+            original,
+            "a failed upgrade must leave the operator's config exactly as it was"
+        );
+        assert_eq!(
+            fs::read_to_string(&current_exe).expect("executable should be restored"),
+            "old binary"
+        );
+        assert!(
+            !install_dir.join(WEB_DIST_DIR).exists(),
+            "the bundle the failed upgrade installed must be rolled back too"
+        );
+    }
+
     #[test]
     fn rollback_removes_files_that_were_not_in_backup() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
