@@ -21,6 +21,10 @@ tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# Editing a config in place without losing the user's comments and layout: the
+# package a config was written for changes on upgrade, and a rewrite through
+# `toml::Value` would reformat the whole file.
+toml_edit = "0.22"
 
 # System metrics
 sysinfo = "0.32"

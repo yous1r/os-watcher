@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{error, warn};
 
-use crate::config::{PackageKind, UpgradeConfig};
+use crate::config::{PackageKind, UpgradeConfig, WEB_DIST_DIR};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GithubRelease {
@@ -335,6 +335,7 @@ impl UpgradeManager {
             extract_archive(&archive_path, &extract_dir).await?;
             let payload_root = find_payload_root(&extract_dir)?;
             install_payload(&payload_root, &install_dir, &current_exe)?;
+            apply_package_layout(&install_dir, &payload_root, package)?;
             Result::<()>::Ok(())
         })
         .await
@@ -808,6 +809,47 @@ fn install_payload(payload_root: &Path, install_dir: &Path, current_exe: &Path) 
         ));
     }
 
+    Ok(())
+}
+
+/// Bring the installed tree in line with the package that was just unpacked.
+///
+/// `install_payload` only ever adds files, which is right for an upgrade but
+/// wrong for a package switch: the full package's bundle stays behind after
+/// switching to node, and the config keeps describing the package that was
+/// replaced. Rollback already restores `config.toml` and `web-dist` from the
+/// backup, so both writes here are covered.
+fn apply_package_layout(install_dir: &Path, payload_root: &Path, package: PackageKind) -> Result<()> {
+    if package == PackageKind::Node && !payload_root.join(WEB_DIST_DIR).is_dir() {
+        let web_dist = install_dir.join(WEB_DIST_DIR);
+        if web_dist.exists() {
+            fs::remove_dir_all(&web_dist)
+                .with_context(|| format!("remove {}", web_dist.display()))?;
+        }
+    }
+
+    reconcile_installed_config(install_dir, package)
+}
+
+/// Rewrite the package-dependent keys of the installed `config.toml`.
+///
+/// A missing config is left missing: a first install writes its own, and
+/// inventing one here would hand the user a config they never asked for.
+fn reconcile_installed_config(install_dir: &Path, package: PackageKind) -> Result<()> {
+    let path = install_dir.join("config.toml");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read {}", path.display()));
+        }
+    };
+
+    let reconciled = crate::config::reconcile_package_config(&text, package)?;
+    if reconciled == text {
+        return Ok(());
+    }
+    fs::write(&path, reconciled).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -1590,6 +1632,77 @@ mod tests {
             .expect_err("an archive without the binary must not report success");
 
         assert!(err.to_string().contains("did not contain"));
+    }
+
+    /// Switching from the full package to the node package must not leave the
+    /// old bundle behind: the config stops pointing at it, and a stale copy
+    /// would keep being served by any config that still does.
+    #[test]
+    fn node_package_removes_a_bundle_left_by_the_full_package() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let install_dir = temp.path().join("install");
+        let payload_root = temp.path().join("payload");
+        fs::create_dir_all(install_dir.join(WEB_DIST_DIR)).expect("installed bundle");
+        fs::create_dir_all(&payload_root).expect("payload dir should be created");
+
+        apply_package_layout(&install_dir, &payload_root, PackageKind::Node)
+            .expect("package layout should apply");
+
+        assert!(!install_dir.join(WEB_DIST_DIR).exists());
+    }
+
+    /// The full package ships its own bundle; the install must keep it.
+    #[test]
+    fn full_package_keeps_its_bundle() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let install_dir = temp.path().join("install");
+        let payload_root = temp.path().join("payload");
+        fs::create_dir_all(install_dir.join(WEB_DIST_DIR)).expect("installed bundle");
+        fs::create_dir_all(payload_root.join(WEB_DIST_DIR)).expect("payload bundle");
+
+        apply_package_layout(&install_dir, &payload_root, PackageKind::Full)
+            .expect("package layout should apply");
+
+        assert!(install_dir.join(WEB_DIST_DIR).is_dir());
+    }
+
+    #[test]
+    fn upgrade_rewrites_the_installed_config_for_the_new_package() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let install_dir = temp.path().join("install");
+        let payload_root = temp.path().join("payload");
+        fs::create_dir_all(&install_dir).expect("install dir should be created");
+        fs::create_dir_all(&payload_root).expect("payload dir should be created");
+        fs::write(
+            install_dir.join("config.toml"),
+            "[node]\n[metrics]\n[network]\n[api]\n[storage]\n\n[web]\nenabled = false\n\n[upgrade]\npackage = \"node\"\n",
+        )
+        .expect("installed config should be written");
+
+        apply_package_layout(&install_dir, &payload_root, PackageKind::Full)
+            .expect("package layout should apply");
+
+        let cfg: crate::config::Config = toml::from_str(
+            &fs::read_to_string(install_dir.join("config.toml")).expect("config should be readable"),
+        )
+        .expect("rewritten config should parse");
+        assert!(cfg.web.enabled, "the full package must serve its dashboard");
+        assert_eq!(cfg.upgrade.package, PackageKind::Full);
+    }
+
+    /// A first install has no config yet; the upgrade must not invent one.
+    #[test]
+    fn upgrade_without_a_config_leaves_it_missing() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let install_dir = temp.path().join("install");
+        let payload_root = temp.path().join("payload");
+        fs::create_dir_all(&install_dir).expect("install dir should be created");
+        fs::create_dir_all(&payload_root).expect("payload dir should be created");
+
+        apply_package_layout(&install_dir, &payload_root, PackageKind::Full)
+            .expect("package layout should apply");
+
+        assert!(!install_dir.join("config.toml").exists());
     }
 
     #[cfg(unix)]

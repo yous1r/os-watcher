@@ -60,7 +60,11 @@
 6. 备份当前二进制、`config.toml`、`config.example.toml`、`web-dist`。
 7. 解压 Release 包，复制 payload：
    - Linux 直接用 `.new` 临时文件替换当前二进制并设置可执行权限。
-   - Windows 先写入 `.new.exe`，重启阶段再停服务、替换、启动。
+   - Windows 先写入 `.new`，重启阶段再停服务、替换、启动。
+   - payload 只做覆盖，不删除既有文件；因此切到 `node` 包时，
+     `install_payload` 之后由 `apply_package_layout` 删掉 `full` 包留下的
+     `web-dist`。
+   - 随后按新包类型调和 `config.toml`（见下节「包类型与配置的一致性」）。
 8. 调度服务重启：
    - Linux 使用 `systemctl restart <service>`。
    - Windows 使用隐藏 PowerShell 进程调用 `sc.exe stop/start`。
@@ -81,6 +85,27 @@ service_name = "os-watcher"
 ```
 
 `node` 包模板默认 `package = "node"` 且不启用 Web；`full` 包模板默认 `package = "full"` 且启用 `web-dist`。
+
+### 包类型与配置的一致性
+
+安装一个包只覆盖它带来的文件，用户的 `config.toml` 始终保留。这在同包升级时
+是对的，但切换 `node`/`full` 后配置会与新装的包不符：装了 `full` 面板仍
+`enabled = false`（页面 404），降到 `node` 后 `web.dir` 还指向残留目录。
+
+因此自升级（`src/upgrade.rs`）和两个部署脚本在安装完 payload 后都会调用同一
+套调和逻辑 `config::reconcile_package_config`，只改写包类型决定的键：
+
+| 键 | `node` | `full` |
+| --- | --- | --- |
+| `[web] enabled` | `false` | `true` |
+| `[web] dir` | 不变 | `web-dist`（仅当原值为相对路径） |
+| `[upgrade] package` | `"node"` | `"full"` |
+
+其余设置与注释原样保留；`[web] dir` 是绝对路径时视为运维自建的前端目录，不改。
+调和是幂等的（同包重复执行不产生 diff），并保留原文件的行尾（CRLF/LF）。
+
+部署脚本通过 `os-watcher reconcile-config --package <node|full>` 复用该实现，
+二进制缺失或执行失败只告警、不中断安装。
 
 ## API
 

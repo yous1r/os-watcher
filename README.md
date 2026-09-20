@@ -7,6 +7,14 @@ os-watcher 是一个去中心化主机资源监控工具，提供节点采集、
 - 普通采集节点：[config.node.example.toml](config.node.example.toml)
 - 带 Web 面板的节点：[config.full.example.toml](config.full.example.toml)
 
+发布包分 `node`（只采集）与 `full`（带 Web 面板）两种，同一台机器可以在两者之间切换：用对应包重新执行 `deploy.sh` / `deploy.ps1`，或在面板里发起自升级并指定包类型。安装时会同步 `config.toml` 中由包类型决定的键（`[web] enabled`、`[web] dir`、`[upgrade] package`），其余设置与注释原样保留；`full` 降级到 `node` 时还会清理包内的 `web-dist`。切换后需重启服务生效。
+
+也可以手工同步（脚本内部调用的就是它）：
+
+```bash
+os-watcher --config config.toml reconcile-config --package full
+```
+
 
 ## 安全警告
 

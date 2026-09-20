@@ -282,12 +282,44 @@ install_payload() {
     c_info "保留现有 config.toml，仅更新 config.example.toml"
   fi
 
+  # 现有 config.toml 描述的是上一个包类型，切换 node/full 后 [web] 与
+  # [upgrade] package 会与新装的包不符（面板打不开 / 升级下载错包）。
+  # 只改这几个键，其余设置与注释原样保留。
+  reconcile_config "$bin_name"
+
   if [[ -d "$root/web-dist" ]]; then
     rm -rf "$SCRIPT_DIR/web-dist"
     cp -a "$root/web-dist" "$SCRIPT_DIR/web-dist"
+  elif [[ "$PACKAGE" == "node" ]]; then
+    # node 包不带前端资源，full 包留下的 web-dist 必须清掉，否则面板
+    # 会继续提供上一版的前端。
+    rm -rf "$SCRIPT_DIR/web-dist"
   fi
 
   c_ok "Release 包已安装到：$SCRIPT_DIR"
+}
+
+# 让 config.toml 跟随刚安装的包类型。配置不存在时交给上面的分支处理；
+# 二进制缺失或执行失败都不该中断安装，只提示手工处理。
+reconcile_config() {
+  local bin_name="$1"
+  local bin_path="$SCRIPT_DIR/$bin_name"
+
+  if [[ ! -f "$SCRIPT_DIR/config.toml" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$bin_path" ]]; then
+    c_warn "未找到 $bin_name，跳过配置同步；如面板打不开请检查 config.toml 的 [web] 段"
+    return 0
+  fi
+
+  # 成功时保持安静，失败时把二进制自己的报错带出来。
+  local output
+  if output="$("$bin_path" --config "$SCRIPT_DIR/config.toml" reconcile-config --package "$PACKAGE" 2>&1)"; then
+    c_ok "已同步 config.toml 到 $PACKAGE 包"
+  else
+    c_warn "配置同步失败：$output"
+  fi
 }
 
 write_linux_service() {

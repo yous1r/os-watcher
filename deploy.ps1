@@ -244,9 +244,45 @@ function Install-Payload([string]$Root, [string]$BinName) {
             Remove-Item -LiteralPath $targetWeb -Recurse -Force
         }
         Copy-Item -LiteralPath $sourceWeb -Destination $targetWeb -Recurse -Force
+    } elseif ($Package -eq 'node') {
+        # node 包不带前端资源，full 包留下的 web-dist 必须清掉，否则面板
+        # 会继续提供上一版的前端。
+        $staleWeb = Join-Path $ScriptDir 'web-dist'
+        if (Test-Path -LiteralPath $staleWeb) {
+            Remove-Item -LiteralPath $staleWeb -Recurse -Force
+        }
     }
 
+    # 现有 config.toml 描述的是上一个包类型，切换 node/full 后 [web] 与
+    # [upgrade] package 会与新装的包不符（面板打不开 / 升级下载错包）。
+    # 只改这几个键，其余设置与注释原样保留。
+    Sync-PackageConfig -BinName $BinName
+
     Write-Ok "Release 包已安装到：$ScriptDir"
+}
+
+function Sync-PackageConfig([string]$BinName) {
+    $configPath = Join-Path $ScriptDir 'config.toml'
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+        return
+    }
+
+    $binPath = Join-Path $ScriptDir $BinName
+    if (-not (Test-Path -LiteralPath $binPath -PathType Leaf)) {
+        Write-Warn "未找到 $BinName，跳过配置同步；如面板打不开请检查 config.toml 的 [web] 段"
+        return
+    }
+
+    # 旧版本二进制没有这个子命令，失败不该中断安装。这里不能重定向 stderr：
+    # PS 5.1 在 $ErrorActionPreference='Stop' 下把原生命令写入 stderr 的
+    # NativeCommandError 当作终止性错误，`2>$null` 会直接中断部署。
+    # 失败时让二进制自己打印原因，再用 $LASTEXITCODE 判断。
+    & $binPath --config $configPath reconcile-config --package $Package | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Ok "已同步 config.toml 到 $Package 包"
+    } else {
+        Write-Warn "配置同步失败（exit $LASTEXITCODE），请检查 config.toml 的 [web] 与 [upgrade] package"
+    }
 }
 
 function Install-Service([string]$BinName) {

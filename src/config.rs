@@ -1,6 +1,9 @@
+use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 /// Root configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,10 +117,10 @@ pub struct WebConfig {
     /// The `--web` CLI flag turns this on regardless of the config value.
     #[serde(default)]
     pub enabled: bool,
-    /// Directory holding the built frontend assets. When it holds no bundle,
-    /// the shipped layouts (`web-dist` in a release bundle, `web/dist` in a
-    /// source checkout) are probed next to the working directory and the
-    /// executable, so one config works in both layouts.
+    /// Directory holding the built frontend assets. A relative path resolves
+    /// against the working directory, or against the install directory when
+    /// running as a service. Release packages unpack their assets into
+    /// `web-dist`; a source checkout builds them into `web/dist`.
     #[serde(default = "default_web_dir")]
     pub dir: String,
 }
@@ -145,7 +148,7 @@ pub struct TuiConfig {
 }
 
 /// Release package flavour used for deploy and self-upgrade.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum PackageKind {
     /// Node-only package without bundled web assets
@@ -518,6 +521,124 @@ pub fn generate_default_config(profile: ConfigProfile) -> String {
     }
 }
 
+/// Directory a release package unpacks its frontend bundle into.
+///
+/// `web.dir` has to name it for the dashboard to be found: a release install
+/// has no `web/dist`, which is the source-checkout default.
+pub const WEB_DIST_DIR: &str = "web-dist";
+
+/// Rewrite the package-dependent keys of a config so they describe `package`.
+///
+/// Installing a package replaces the files it ships but deliberately keeps the
+/// user's `config.toml`, which leaves the two disagreeing after a node/full
+/// switch: the dashboard stays disabled after installing the full package, and
+/// the full package's bundle keeps being referenced after switching to node.
+/// Only the keys the package decides are touched; everything else, comments
+/// included, survives untouched.
+pub fn reconcile_package_config(text: &str, package: PackageKind) -> anyhow::Result<String> {
+    // `toml_edit` drops carriage returns when it re-renders, so normalize
+    // before parsing and restore the file's own line endings afterwards.
+    let crlf = text.contains("\r\n");
+    let normalized = text.replace("\r\n", "\n");
+    let mut doc =
+        DocumentMut::from_str(&normalized).context("parse config TOML for reconciliation")?;
+
+    let web = ensure_section(&mut doc, "web")?;
+    if package == PackageKind::Full {
+        set_value(web, "enabled", Value::from(true));
+        // A relative dir is anchored to the install directory, which is where
+        // the bundle lands. An absolute path is an operator's own out-of-tree
+        // bundle, so it is left alone.
+        let managed = web
+            .get("dir")
+            .and_then(|item| item.as_str())
+            .map(|dir| Path::new(dir).is_relative())
+            .unwrap_or(true);
+        if managed {
+            set_value(web, "dir", Value::from(WEB_DIST_DIR));
+        }
+    } else {
+        set_value(web, "enabled", Value::from(false));
+    }
+
+    // The next self-upgrade installs the package this config describes.
+    let upgrade = ensure_section(&mut doc, "upgrade")?;
+    set_value(upgrade, "package", Value::from(package.as_str()));
+    set_package_comment(upgrade, package);
+
+    let out = doc.to_string();
+    let out = if crlf { out.replace('\n', "\r\n") } else { out };
+
+    // A config that loaded before must still load, or an upgrade would write
+    // one the agent silently falls back to defaults on. A file that was
+    // already incomplete is the user's own state: reconciliation keeps its
+    // edits rather than failing the whole install over it.
+    if toml::from_str::<Config>(&normalized).is_ok() {
+        toml::from_str::<Config>(&out)
+            .map_err(|err| anyhow!("reconciled config no longer parses: {err}"))?;
+    }
+    Ok(out)
+}
+
+/// Borrow `[name]`, adding an empty table when the section is missing.
+fn ensure_section<'a>(doc: &'a mut DocumentMut, name: &str) -> anyhow::Result<&'a mut dyn TableLike> {
+    let root = doc.as_table_mut();
+    if !root.contains_key(name) {
+        root.insert(name, Item::Table(Table::new()));
+    }
+    root.get_mut(name)
+        .and_then(|item| item.as_table_like_mut())
+        .ok_or_else(|| anyhow!("[{name}] in the config is not a table"))
+}
+
+/// Set `key` in `section`, keeping the old value's decor.
+///
+/// Replacing an existing `Value` in place is what preserves the inline comment
+/// and indentation around it; only a key that is not there yet is inserted.
+fn set_value(section: &mut dyn TableLike, key: &str, new: Value) {
+    match section.get_mut(key).and_then(|item| item.as_value_mut()) {
+        Some(value) => {
+            let decor = value.decor().clone();
+            *value = new;
+            *value.decor_mut() = decor;
+        }
+        None => {
+            section.insert(key, Item::Value(new));
+        }
+    }
+}
+
+/// The comment each release template ships on `[upgrade] package`. The wording
+/// names the package, so rewriting the value without it leaves the file
+/// contradicting itself.
+const PACKAGE_COMMENT_NODE: &str = "默认升级普通节点包";
+const PACKAGE_COMMENT_FULL: &str = "默认升级带 Web 面板的完整包";
+
+/// Point the inline comment on `[upgrade] package` at `package`.
+///
+/// Only the two wordings the release templates ship are swapped, so an
+/// operator's own comment is left exactly as written.
+fn set_package_comment(section: &mut dyn TableLike, package: PackageKind) {
+    let (from, to) = match package {
+        PackageKind::Full => (PACKAGE_COMMENT_NODE, PACKAGE_COMMENT_FULL),
+        PackageKind::Node => (PACKAGE_COMMENT_FULL, PACKAGE_COMMENT_NODE),
+    };
+
+    let Some(value) = section.get_mut("package").and_then(|item| item.as_value_mut()) else {
+        return;
+    };
+    let replaced = {
+        let Some(comment) = value.decor().suffix().and_then(|suffix| suffix.as_str()) else {
+            return;
+        };
+        if !comment.contains(from) {
+            return;
+        }
+        comment.replace(from, to)
+    };
+    value.decor_mut().set_suffix(replaced);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +646,10 @@ mod tests {
     fn parse(template: &str) -> Config {
         toml::from_str(template).expect("template must be valid config TOML")
     }
+
+    /// The sections a config needs before it loads at all, so a fragment can
+    /// be reconciled and then checked the way the agent loads it.
+    const REQUIRED_SECTIONS: &str = "[node]\n[metrics]\n[network]\n[api]\n[storage]\n";
 
     #[test]
     fn node_template_disables_web_dashboard() {
@@ -546,6 +671,184 @@ mod tests {
         let node = generate_default_config(ConfigProfile::Node);
         let full = generate_default_config(ConfigProfile::Full);
         assert_ne!(node, full);
+    }
+
+    #[test]
+    fn reconcile_to_full_enables_the_dashboard_in_a_node_config() {
+        let reconciled = reconcile_package_config(NODE_CONFIG_TEMPLATE, PackageKind::Full)
+            .expect("reconciling a released config must succeed");
+
+        let cfg = parse(&reconciled);
+        assert!(cfg.web.enabled, "the full package must serve its dashboard");
+        assert_eq!(cfg.web.dir, WEB_DIST_DIR);
+        assert_eq!(cfg.upgrade.package, PackageKind::Full);
+        assert!(
+            reconciled.contains("dir = \"web-dist\""),
+            "an added key must render as a normal assignment: {reconciled}"
+        );
+    }
+
+    #[test]
+    fn reconcile_to_node_disables_the_dashboard_in_a_full_config() {
+        let reconciled = reconcile_package_config(FULL_CONFIG_TEMPLATE, PackageKind::Node)
+            .expect("reconciling a released config must succeed");
+
+        let cfg = parse(&reconciled);
+        assert!(!cfg.web.enabled, "the node package ships no bundle to serve");
+        assert_eq!(cfg.upgrade.package, PackageKind::Node);
+    }
+
+    #[test]
+    fn reconcile_is_idempotent_for_the_same_package() {
+        let once = reconcile_package_config(NODE_CONFIG_TEMPLATE, PackageKind::Full)
+            .expect("reconcile must succeed");
+        let twice =
+            reconcile_package_config(&once, PackageKind::Full).expect("reconcile must succeed");
+
+        assert_eq!(once, twice, "a second upgrade must not keep rewriting");
+    }
+
+    /// The config holds an operator's own settings and comments; only the keys
+    /// the package decides may change.
+    #[test]
+    fn reconcile_keeps_unrelated_settings_and_comments() {
+        let original = "\
+# 本机配置
+[node]
+name = \"my-server\"
+
+[metrics]
+[network]
+[api]
+
+[web]
+enabled = true   # 面板开关
+dir = \"web-dist\"
+
+[upgrade]
+package = \"full\"
+github_repo = \"someone/fork\"
+proxy = \"http://10.0.0.142:10808\"
+
+[storage]
+db_path = \"D:/data/os-watcher.db\"
+";
+        let reconciled =
+            reconcile_package_config(original, PackageKind::Node).expect("reconcile must succeed");
+
+        assert!(reconciled.contains("# 本机配置"));
+        assert!(
+            reconciled.contains("enabled = false   # 面板开关"),
+            "the inline comment must stay on the rewritten line: {reconciled}"
+        );
+        let cfg = parse(&reconciled);
+        assert_eq!(cfg.node.name.as_deref(), Some("my-server"));
+        assert_eq!(cfg.upgrade.github_repo, "someone/fork");
+        assert_eq!(
+            cfg.upgrade.proxy.as_deref(),
+            Some("http://10.0.0.142:10808")
+        );
+        assert_eq!(cfg.storage.db_path, "D:/data/os-watcher.db");
+    }
+
+    /// An out-of-tree dashboard is a deliberate choice, not a package default.
+    #[test]
+    fn reconcile_leaves_an_absolute_web_dir_alone() {
+        let absolute = if cfg!(windows) {
+            "D:/dashboard"
+        } else {
+            "/opt/dashboard"
+        };
+        let original = format!("{REQUIRED_SECTIONS}[web]\nenabled = false\ndir = \"{absolute}\"\n");
+
+        let reconciled =
+            reconcile_package_config(&original, PackageKind::Full).expect("reconcile must succeed");
+
+        let cfg = parse(&reconciled);
+        assert!(cfg.web.enabled);
+        assert_eq!(cfg.web.dir, absolute);
+    }
+
+    /// The shipped comment names the package, so a rewritten value must not
+    /// leave the line describing the package it just stopped being.
+    #[test]
+    fn reconcile_retargets_the_package_comment() {
+        let original = format!(
+            "{REQUIRED_SECTIONS}[web]\nenabled = false\n\n[upgrade]\npackage = \"node\"                # {PACKAGE_COMMENT_NODE}\n"
+        );
+
+        let reconciled =
+            reconcile_package_config(&original, PackageKind::Full).expect("reconcile must succeed");
+
+        assert_eq!(parse(&reconciled).upgrade.package, PackageKind::Full);
+        assert!(
+            reconciled.contains(PACKAGE_COMMENT_FULL),
+            "got: {reconciled}"
+        );
+        assert!(
+            !reconciled.contains(PACKAGE_COMMENT_NODE),
+            "the stale comment must be gone: {reconciled}"
+        );
+
+        // And back again, so a downgrade is not left naming the full package.
+        let back =
+            reconcile_package_config(&reconciled, PackageKind::Node).expect("reconcile must succeed");
+        assert_eq!(parse(&back).upgrade.package, PackageKind::Node);
+        assert!(back.contains(PACKAGE_COMMENT_NODE), "got: {back}");
+        assert!(!back.contains(PACKAGE_COMMENT_FULL), "got: {back}");
+    }
+
+    /// An operator's own comment must survive; only the shipped wording moves.
+    #[test]
+    fn reconcile_keeps_an_operator_comment_on_the_package_key() {
+        let original =
+            format!("{REQUIRED_SECTIONS}[upgrade]\npackage = \"node\"  # 我这台是采集机\n");
+
+        let reconciled =
+            reconcile_package_config(&original, PackageKind::Full).expect("reconcile must succeed");
+
+        assert!(
+            reconciled.contains("# 我这台是采集机"),
+            "got: {reconciled}"
+        );
+    }
+
+    #[test]
+    fn reconcile_creates_missing_sections_as_tables() {
+        let original = "[node]\n[metrics]\n[network]\n[api]\n[storage]\n";
+
+        let reconciled =
+            reconcile_package_config(original, PackageKind::Full).expect("reconcile must succeed");
+
+        assert!(reconciled.contains("[web]"), "got: {reconciled}");
+        assert!(
+            !reconciled.contains("web = {"),
+            "an added section must not become an inline table: {reconciled}"
+        );
+        let cfg = parse(&reconciled);
+        assert!(cfg.web.enabled);
+        assert_eq!(cfg.upgrade.package, PackageKind::Full);
+    }
+
+    /// A release config is written on Windows and edited on Linux (and the
+    /// other way round); reconciliation must not silently convert it.
+    #[test]
+    fn reconcile_preserves_the_files_line_endings() {
+        let crlf = format!("{REQUIRED_SECTIONS}[web]\nenabled = false\n").replace('\n', "\r\n");
+        let reconciled =
+            reconcile_package_config(&crlf, PackageKind::Full).expect("reconcile must succeed");
+        assert!(parse(&reconciled).web.enabled);
+        assert_eq!(
+            reconciled.matches('\n').count(),
+            reconciled.matches("\r\n").count(),
+            "no bare LF may appear in a CRLF config"
+        );
+
+        let lf = format!("{REQUIRED_SECTIONS}[web]\nenabled = true\n");
+        let reconciled =
+            reconcile_package_config(&lf, PackageKind::Node).expect("reconcile must succeed");
+        assert!(!parse(&reconciled).web.enabled);
+        assert!(!reconciled.contains('\r'), "an LF config must stay LF");
     }
 
     #[test]

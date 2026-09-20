@@ -91,6 +91,18 @@ enum Commands {
         #[arg(long, value_enum, default_value = "node")]
         profile: ConfigProfile,
     },
+    /// Rewrite the package-dependent keys of the config in place.
+    ///
+    /// Installing a package keeps the existing `config.toml`, so after a
+    /// node/full switch the config still describes the old package. This
+    /// updates `[web]` and `[upgrade] package` to match, leaving every other
+    /// setting and comment untouched. The deploy scripts call it after
+    /// unpacking a package.
+    ReconcileConfig {
+        /// Package flavour the installed files belong to
+        #[arg(long, value_enum)]
+        package: PackageKind,
+    },
     /// Show status of all known nodes (requires a running agent)
     Status {
         /// Agent API address
@@ -198,6 +210,18 @@ async fn run(cli: Cli) -> Result<()> {
             print!("{}", generate_default_config(profile));
         }
 
+        Commands::ReconcileConfig { package } => {
+            let path = service::anchor(&cli.config);
+            if reconcile_config_file(&path, package)? {
+                info!("Updated {} for the {package} package", path.display());
+            } else {
+                info!(
+                    "{} already matches the {package} package",
+                    path.display()
+                );
+            }
+        }
+
         Commands::Status { api } => {
             run_status_check(&api).await?;
         }
@@ -284,6 +308,26 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Rewrite the package-dependent keys of the config at `path`.
+///
+/// Returns whether the file changed. A missing file is left missing rather
+/// than created: the deploy scripts call this after unpacking a package, and
+/// the first install has already written its own config by then.
+fn reconcile_config_file(path: &Path, package: PackageKind) -> Result<bool> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+
+    let reconciled = crate::config::reconcile_package_config(&text, package)?;
+    if reconciled == text {
+        return Ok(false);
+    }
+    std::fs::write(path, reconciled).with_context(|| format!("write {}", path.display()))?;
+    Ok(true)
 }
 
 fn parse_package_kind(value: &str) -> Result<PackageKind> {
