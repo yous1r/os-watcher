@@ -299,25 +299,42 @@ export interface UninstallResult {
   message: string;
 }
 
-/** 部署请求首帧，通过 WebSocket 发送给后端。 */
+/** 远程操作类型：部署新节点，或卸载已有节点。 */
+export type DeployAction = "deploy" | "uninstall";
+
+/** 部署/卸载请求首帧，通过 WebSocket 发送给后端。 */
 export interface DeployRequest {
+  /**
+   * 操作类型。协议允许省略（后端按 deploy 处理），面板始终显式发送。
+   */
+  action: DeployAction;
   host: string;
   port: number;
   username: string;
   auth: DeployAuth;
-  package: PackageKind;
-  api_port: number;
-  gossip_port: number;
-  peers: string[];
   service_name: string;
   install_dir: string;
-  version: string;
-  repo: string | null;
-  proxy: string | null;
+  // 部署专属字段：卸载时后端一律忽略，因此都是可选的（后端各自有默认值）。
+  package?: PackageKind;
+  api_port?: number;
+  gossip_port?: number;
+  peers?: string[];
+  version?: string;
+  repo?: string | null;
+  proxy?: string | null;
+  // 卸载专属字段：部署时后端一律忽略。
+  backup?: boolean;
+  keep_config?: boolean;
+  backup_dir?: string | null;
 }
 
-/** 部署阶段，对应后端 progress 事件的 step。 */
-export type DeployStep = "connecting" | "uploading" | "installing" | "verifying";
+/** 部署/卸载阶段，对应后端 progress 事件的 step。 */
+export type DeployStep =
+  | "connecting"
+  | "uploading"
+  | "installing"
+  | "uninstalling"
+  | "verifying";
 
 /** 后端流式返回的部署事件，`type` 为标签。 */
 export type DeployEvent =

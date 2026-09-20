@@ -57,6 +57,7 @@ export function Overview(props: {
   snapshots: NodeSnapshot[];
   versionInfo: VersionInfo | null;
   onUpgradeRequested?: () => void;
+  onUninstallNode?: (snapshot: NodeSnapshot) => void;
 }) {
   const [target, setTarget] = createSignal<NodeSnapshot | null>(null);
   const [selectedPackage, setSelectedPackage] = createSignal<PackageKind>("node");
@@ -223,6 +224,23 @@ export function Overview(props: {
                     >
                       <span class="node-version-new">→ {latestVersion()}</span>
                     </Show>
+                    {/* 行尾操作：预填该节点主机地址后打开远程卸载向导。 */}
+                    <button
+                      type="button"
+                      class="node-uninstall-btn"
+                      title={
+                        !authStore.canManage()
+                          ? "需要管理员登录"
+                          : `远程卸载 ${snap.info.hostname}`
+                      }
+                      aria-label={`远程卸载 ${snap.info.hostname}`}
+                      onClick={() => {
+                        if (!authStore.allowed()) return;
+                        props.onUninstallNode?.(snap);
+                      }}
+                    >
+                      卸载
+                    </button>
                   </div>
                   <Show
                     when={m}

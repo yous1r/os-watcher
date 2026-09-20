@@ -321,6 +321,33 @@ body {
   font-weight: 600;
 }
 
+/* 行尾的远程卸载入口：常态低调，悬停或聚焦时才用危险色点亮。 */
+.node-uninstall-btn {
+  margin-left: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 8px;
+  background: transparent;
+  color: var(--text-faint);
+  font: inherit;
+  line-height: 1.5;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+
+.node-uninstall-btn:hover {
+  border-color: var(--crit);
+  background: rgba(248, 81, 73, 0.12);
+  color: var(--crit);
+}
+
+.node-uninstall-btn:focus-visible {
+  outline: 2px solid var(--crit);
+  outline-offset: 2px;
+  border-color: var(--crit);
+  color: var(--crit);
+}
+
 .node-name {
   font-weight: 600;
   font-size: 15.5px;
@@ -1248,6 +1275,13 @@ body {
   border-radius: var(--radius-sm);
   box-shadow: var(--shadow-hover);
   padding: 18px;
+}
+
+/* 远程卸载向导：复用 upgrade-dialog 的外壳，只是字段比确认框多，需要更宽。 */
+.remote-uninstall-dialog {
+  width: min(520px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
 }
 
 .wizard-steps {

@@ -171,6 +171,28 @@ Content-Type: application/json
 - **`uninstall.cmd` 自身不能立即删除**：cmd.exe 逐行读取批处理文件，删除它会以「系统找不到指定的路径」中止并丢掉退出码，故与脚本自身一样登记重启清理。
 - Windows 逻辑只用 cmd / PowerShell 实现；`uninstall.sh` 只处理 Linux，检测到 Windows 会拒绝执行并指向 `uninstall.cmd`。
 
+### 远程卸载（面板控制任意节点）
+
+本地卸载只能删掉面板自己所在机器的服务，管不到其它节点。远程卸载复用既有的 SSH 部署通道：
+WebSocket `/api/v1/nodes/deploy` 的首帧多一个 `action` 字段（`"deploy"` 默认 / `"uninstall"`），
+`uninstall` 时把 `uninstall.sh` 用 heredoc 推到目标节点的 `install_dir` 下执行。
+
+- **脚本由面板自带（`include_str!("../uninstall.sh")`），与目标节点版本无关**。这正是该能力的关键：
+  节点上装的是多老的版本都不影响卸载，因为执行的脚本来自面板，不是节点自己那份。
+  若改用节点上的 `uninstall.sh`，老版本缺参数或行为不一致都会让卸载失败。
+- **预检先于建目录**：先跑 `test -e '<install_dir>/os-watcher'`，不像安装目录就 `Fatal` 结束（不重试）。
+  否则 `install_dir` 填错时会先 `mkdir -p` 留下一个空目录和一份脚本，再把错误报给用户。
+- **`action` 省略默认 `deploy`**，旧前端不传该字段时行为不变。
+- **卸载选项**：`backup`（默认 `true`，与本地接口的默认值不同——远程卸载误删后无法补救）、
+  `keep_config`、`backup_dir`。`backup_dir` 必须是绝对路径、不含引号/控制字符/`%`（`%` 会被 systemd 当 specifier 展开）。
+- **卸载校验用 `test ! -e '<install_dir>/os-watcher'`**：`--keep-config` 只保留 `config.toml`，
+  可执行文件在所有分支下都会被删，故该断言对所有分支成立。
+- **`uninstall.sh` 加安装目录护栏**（`verify_install_dir`）：远程卸载时 `SCRIPT_DIR` 完全来自请求里的
+  `install_dir`，填错会让删除循环清空那个目录。黑名单拦掉 `/`、`/etc`、`/usr`、`/var` 等 18 个系统目录，
+  并要求目录下至少存在 `os-watcher`、`os-watcher.exe`、`config.toml` 之一。
+- **仅支持 Linux 远程卸载**。与既有 deploy 通道的能力对齐（该通道本就是 Linux/SSH/systemd）；
+  Windows 远程卸载未实现，UI 与文档都不声称支持。
+
 ## 安全边界
 
 本版本按需求不加入登录认证，也不做节点侧鉴权。安全边界依赖部署网络、反向代理、系统防火墙或内网访问控制。UI 弹窗只用于降低误操作风险，不作为安全机制。

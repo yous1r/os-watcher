@@ -1,6 +1,11 @@
 import { createSignal } from "solid-js";
 import { openDeployWebSocket } from "./api";
-import type { DeployEvent, DeployRequest, DeployStep } from "./types";
+import type {
+  DeployAction,
+  DeployEvent,
+  DeployRequest,
+  DeployStep,
+} from "./types";
 
 const MAX_LOG_LINES = 500;
 
@@ -19,6 +24,7 @@ export interface DeployLogLine {
 }
 
 // 模块级状态：脱离任何组件生命周期，因此对话框卸载不会影响它。
+const [action, setAction] = createSignal<DeployAction>("deploy");
 const [phase, setPhase] = createSignal<DeployPhase>("idle");
 const [currentStep, setCurrentStep] = createSignal<DeployStep>("connecting");
 const [statusMessage, setStatusMessage] = createSignal("");
@@ -73,7 +79,9 @@ function handleEvent(ws: WebSocket, event: DeployEvent) {
       break;
     case "success":
       setPhase("success");
-      setStatusMessage(event.message || "部署完成");
+      setStatusMessage(
+        event.message || (action() === "uninstall" ? "卸载完成" : "部署完成")
+      );
       if (!deployedFired) {
         deployedFired = true;
         onDeployedCb?.();
@@ -82,22 +90,26 @@ function handleEvent(ws: WebSocket, event: DeployEvent) {
       break;
     case "error":
       setPhase("error");
-      setStatusMessage(event.message || "部署失败");
+      setStatusMessage(
+        event.message || (action() === "uninstall" ? "卸载失败" : "部署失败")
+      );
       closeSocket(ws);
       break;
   }
 }
 
 /**
- * 启动一次部署：建立 WebSocket，onopen 发送首帧请求。
- * 连接与状态都在模块级持有，因此关闭对话框只是隐藏 UI，部署继续进行。
+ * 启动一次远程操作（部署或卸载）：建立 WebSocket，onopen 发送首帧请求。
+ * 连接与状态都在模块级持有，因此关闭对话框只是隐藏 UI，操作继续进行。
  * onDeployed 在成功时恰好触发一次，与对话框是否打开无关。
  */
 function start(request: DeployRequest, onDeployed?: () => void) {
-  if (phase() === "running") return; // 单部署假设：已有进行中则忽略
+  if (phase() === "running") return; // 单操作假设：已有进行中则忽略
 
   closeSocket();
 
+  // 先落定操作类型：后续所有文案与步骤都据此选择。
+  setAction(request.action ?? "deploy");
   setLogs([]);
   setRetryInfo(null);
   setCurrentStep("connecting");
@@ -122,7 +134,9 @@ function start(request: DeployRequest, onDeployed?: () => void) {
       ws.send(JSON.stringify(request));
     } catch {
       setPhase("error");
-      setStatusMessage("部署请求发送失败");
+      setStatusMessage(
+        action() === "uninstall" ? "卸载请求发送失败" : "部署请求发送失败"
+      );
       closeSocket(ws);
     }
   };
@@ -147,12 +161,14 @@ function start(request: DeployRequest, onDeployed?: () => void) {
     detachSocketHandlers(ws);
     if (phase() === "running") {
       setPhase("error");
-      setStatusMessage("连接已断开，部署未完成");
+      setStatusMessage(
+        action() === "uninstall" ? "连接已断开，卸载未完成" : "连接已断开，部署未完成"
+      );
     }
   };
 }
 
-/** 用户主动中止进行中的部署：断开连接并回到 idle。 */
+/** 用户主动中止进行中的操作：断开连接并回到 idle。 */
 function cancel() {
   closeSocket();
   reset();
@@ -161,6 +177,7 @@ function cancel() {
 /** 确认终态结果后清空，让入口回到「添加节点」。 */
 function reset() {
   closeSocket();
+  setAction("deploy");
   setPhase("idle");
   setStatusMessage("");
   setRetryInfo(null);
@@ -171,6 +188,7 @@ function reset() {
 }
 
 export const deployStore = {
+  action,
   phase,
   currentStep,
   statusMessage,

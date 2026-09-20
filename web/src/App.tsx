@@ -16,6 +16,7 @@ import { Alerts } from "./views/Alerts";
 import { NotifySettings } from "./views/NotifySettings";
 import { AddNodeDialog } from "./views/AddNodeDialog";
 import { UninstallDialog } from "./views/UninstallDialog";
+import { RemoteUninstallDialog } from "./views/RemoteUninstallDialog";
 import { LoginDialog } from "./views/LoginDialog";
 import { deployStore } from "./deployStore";
 import { authStore } from "./authStore";
@@ -27,6 +28,9 @@ export default function App() {
   const [lastUpdate, setLastUpdate] = createSignal("--:--:--");
   const [addNodeOpen, setAddNodeOpen] = createSignal(false);
   const [uninstallOpen, setUninstallOpen] = createSignal(false);
+  const [remoteUninstallOpen, setRemoteUninstallOpen] = createSignal(false);
+  // 从概览行点「卸载」时预填的主机地址；顶栏入口不预填。
+  const [remoteUninstallHost, setRemoteUninstallHost] = createSignal<string | undefined>();
 
   // 轮询触发器：每个刷新周期递增，驱动 createResource 重新拉取。
   const [tick, setTick] = createSignal(0);
@@ -188,11 +192,14 @@ export default function App() {
           <button
             type="button"
             class="add-node-btn"
-            classList={{ deploying: deployStore.isRunning() }}
+            classList={{
+              deploying:
+                deployStore.isRunning() && deployStore.action() === "deploy",
+            }}
             title={
               !authStore.canManage()
                 ? "需要管理员登录"
-                : deployStore.isRunning()
+                : deployStore.isRunning() && deployStore.action() === "deploy"
                   ? "部署进行中，点击查看进度"
                   : "添加节点"
             }
@@ -201,9 +208,9 @@ export default function App() {
               setAddNodeOpen(true);
             }}
           >
-            {deployStore.isRunning()
+            {deployStore.isRunning() && deployStore.action() === "deploy"
               ? "部署中…"
-              : deployStore.isActive()
+              : deployStore.isActive() && deployStore.action() === "deploy"
                 ? "部署结果"
                 : "+ 添加节点"}
           </button>
@@ -217,6 +224,32 @@ export default function App() {
             }}
           >
             卸载
+          </button>
+          <button
+            type="button"
+            class="add-node-btn uninstall-btn"
+            classList={{
+              deploying:
+                deployStore.isRunning() && deployStore.action() === "uninstall",
+            }}
+            title={
+              !authStore.canManage()
+                ? "需要管理员登录"
+                : deployStore.isRunning() && deployStore.action() === "uninstall"
+                  ? "远程卸载进行中，点击查看进度"
+                  : "通过 SSH 卸载远程节点上的 os-watcher"
+            }
+            onClick={() => {
+              if (!authStore.allowed()) return;
+              setRemoteUninstallHost(undefined);
+              setRemoteUninstallOpen(true);
+            }}
+          >
+            {deployStore.isRunning() && deployStore.action() === "uninstall"
+              ? "卸载中…"
+              : deployStore.isActive() && deployStore.action() === "uninstall"
+                ? "卸载结果"
+                : "远程卸载"}
           </button>
         </div>
       </header>
@@ -246,6 +279,10 @@ export default function App() {
             snapshots={snapshots()}
             versionInfo={versionInfo()}
             onUpgradeRequested={refetchVersion}
+            onUninstallNode={(snapshot) => {
+              setRemoteUninstallHost(snapshot.info.api_addr);
+              setRemoteUninstallOpen(true);
+            }}
           />
         </Tabs.Content>
         <Tabs.Content value="detail" class="tab-content">
@@ -278,6 +315,18 @@ export default function App() {
 
       <Show when={uninstallOpen()}>
         <UninstallDialog onClose={() => setUninstallOpen(false)} />
+      </Show>
+
+      <Show when={remoteUninstallOpen()}>
+        <RemoteUninstallDialog
+          nodes={snapshots()}
+          initialHost={remoteUninstallHost()}
+          onClose={() => {
+            setRemoteUninstallOpen(false);
+            setRemoteUninstallHost(undefined);
+          }}
+          onDone={() => setTick((t) => t + 1)}
+        />
       </Show>
 
       <Show when={authStore.loginOpen()}>

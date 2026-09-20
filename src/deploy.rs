@@ -40,6 +40,16 @@ pub enum DeployAuth {
     },
 }
 
+/// 请求意图：部署新节点，还是卸载远端已有节点。
+/// 与前端 `DeployAction` 对应；省略时默认 `Deploy`，保持旧前端兼容。
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeployAction {
+    #[default]
+    Deploy,
+    Uninstall,
+}
+
 /// 部署请求首帧，前端通过 WebSocket 发来。字段名与前端 `DeployRequest` 一致。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeployRequest {
@@ -56,6 +66,18 @@ pub struct DeployRequest {
     pub version: String,
     pub repo: Option<String>,
     pub proxy: Option<String>,
+    /// 请求意图，决定走部署还是卸载流程。
+    #[serde(default)]
+    pub action: DeployAction,
+    /// 卸载时是否备份 config.toml；部署时忽略。
+    #[serde(default)]
+    pub backup: bool,
+    /// 卸载时是否保留 config.toml；部署时忽略。
+    #[serde(default)]
+    pub keep_config: bool,
+    /// 卸载备份目录；`None` 表示由远端脚本自行决定默认目录。
+    #[serde(default)]
+    pub backup_dir: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +96,14 @@ struct DeployRequestPayload {
     version: Option<String>,
     repo: Option<String>,
     proxy: Option<String>,
+    #[serde(default)]
+    action: Option<DeployAction>,
+    #[serde(default)]
+    backup: Option<bool>,
+    #[serde(default)]
+    keep_config: Option<bool>,
+    #[serde(default)]
+    backup_dir: Option<String>,
 }
 
 pub(crate) fn parse_request(
@@ -108,6 +138,10 @@ pub(crate) fn parse_request(
         version: payload.version.unwrap_or_else(|| "latest".to_string()),
         repo: Some(payload.repo.unwrap_or_else(|| default_repo.to_string())),
         proxy: payload.proxy,
+        action: payload.action.unwrap_or_default(),
+        backup: payload.backup.unwrap_or(false),
+        keep_config: payload.keep_config.unwrap_or(false),
+        backup_dir: payload.backup_dir,
     })
 }
 
@@ -161,13 +195,14 @@ impl Privilege {
     }
 }
 
-/// 部署阶段，对应前端 `DeployStep`。
+/// 部署/卸载阶段，对应前端 `DeployStep`。
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeployStep {
     Connecting,
     Uploading,
     Installing,
+    Uninstalling,
     Verifying,
 }
 
@@ -253,11 +288,11 @@ pub async fn run_deploy(
         attempt += 1;
         match deploy_once(&request, &config, &tx).await {
             Ok(()) => {
-                let _ = tx
-                    .send(DeployEvent::Success {
-                        message: format!("节点 {} 部署完成", request.host),
-                    })
-                    .await;
+                let message = match request.action {
+                    DeployAction::Deploy => format!("节点 {} 部署完成", request.host),
+                    DeployAction::Uninstall => format!("节点 {} 卸载完成", request.host),
+                };
+                let _ = tx.send(DeployEvent::Success { message }).await;
                 return;
             }
             Err(DeployError::Fatal(e)) => {
@@ -293,7 +328,7 @@ pub async fn run_deploy(
     }
 }
 
-/// 单轮部署：任一阶段失败即返回，由 `run_deploy` 决定是否重试。
+/// 单轮部署/卸载：任一阶段失败即返回，由 `run_deploy` 决定是否重试。
 async fn deploy_once(
     request: &DeployRequest,
     config: &DeployConfig,
@@ -321,6 +356,26 @@ async fn deploy_once(
             })?;
     }
 
+    match request.action {
+        DeployAction::Deploy => deploy_phases(request, &handle, &privilege, tx).await?,
+        DeployAction::Uninstall => uninstall_phases(request, &handle, &privilege, tx).await?,
+    }
+
+    // 优雅断开，忽略断开错误。
+    let _ = handle
+        .disconnect(Disconnect::ByApplication, "deploy finished", "")
+        .await;
+
+    Ok(())
+}
+
+/// 部署流程的 3 个后续阶段：上传 deploy.sh → 安装 → 校验。
+async fn deploy_phases(
+    request: &DeployRequest,
+    handle: &Handle<ClientHandler>,
+    privilege: &Privilege,
+    tx: &mpsc::Sender<DeployEvent>,
+) -> Result<(), DeployError> {
     // —— 阶段 2：上传 deploy.sh ——
     let _ = tx
         .send(DeployEvent::Progress {
@@ -334,11 +389,11 @@ async fn deploy_once(
 
     // 建目录 + 落盘脚本，都走 sudo（安装目录通常需要 root）。
     let mkdir_cmd = privilege.wrap(&format!("mkdir -p {}", shell_quote(install_dir)));
-    run_command(&handle, &mkdir_cmd, privilege.stdin(), tx)
+    run_command(handle, &mkdir_cmd, privilege.stdin(), tx)
         .await
         .map_err(DeployError::Retryable)?;
 
-    upload_script(&handle, &script_path, DEPLOY_SCRIPT, &privilege, tx)
+    upload_script(handle, &script_path, DEPLOY_SCRIPT, privilege, tx)
         .await
         .map_err(DeployError::Retryable)?;
 
@@ -350,8 +405,8 @@ async fn deploy_once(
         })
         .await;
 
-    let install_cmd = build_install_command(request, &script_path, &privilege);
-    run_command(&handle, &install_cmd, privilege.stdin(), tx)
+    let install_cmd = build_install_command(request, &script_path, privilege);
+    run_command(handle, &install_cmd, privilege.stdin(), tx)
         .await
         .map_err(DeployError::Retryable)?;
 
@@ -363,15 +418,84 @@ async fn deploy_once(
         })
         .await;
 
-    let verify_cmd = build_verify_command(&request.service_name, &privilege);
-    run_command(&handle, &verify_cmd, privilege.stdin(), tx)
+    let verify_cmd = build_verify_command(&request.service_name, privilege);
+    run_command(handle, &verify_cmd, privilege.stdin(), tx)
         .await
         .map_err(DeployError::Retryable)?;
 
-    // 优雅断开，忽略断开错误。
-    let _ = handle
-        .disconnect(Disconnect::ByApplication, "deploy finished", "")
+    Ok(())
+}
+
+/// 卸载流程的 3 个后续阶段：上传 uninstall.sh → 执行 → 校验。
+///
+/// 预检放在建目录之前：`install_dir` 填错时（例如 `/opt/foo`）先失败，
+/// 而不是先留下一个空目录和一份脚本。
+async fn uninstall_phases(
+    request: &DeployRequest,
+    handle: &Handle<ClientHandler>,
+    privilege: &Privilege,
+    tx: &mpsc::Sender<DeployEvent>,
+) -> Result<(), DeployError> {
+    // —— 阶段 2：上传 uninstall.sh ——
+    let _ = tx
+        .send(DeployEvent::Progress {
+            step: DeployStep::Uploading,
+            message: "上传卸载脚本 …".to_string(),
+        })
         .await;
+
+    let install_dir = request.install_dir.trim_end_matches('/');
+    let script_path = format!("{install_dir}/uninstall.sh");
+
+    // 预检：目标目录里必须已有可执行文件 os-watcher，否则不像安装目录。
+    // 失败是永久错误——重试只会重复失败，且报错要能提示用户改 install_dir。
+    let precheck_cmd = privilege.wrap(&format!(
+        "test -e {}",
+        shell_quote(&format!("{install_dir}/os-watcher"))
+    ));
+    run_command(handle, &precheck_cmd, privilege.stdin(), tx)
+        .await
+        .map_err(|error| {
+            DeployError::Fatal(anyhow!(
+                "目标目录不像 os-watcher 安装目录，请确认 install_dir：{error}"
+            ))
+        })?;
+
+    // 目录可能已存在，但写脚本文件仍需要 sudo 权限。
+    let mkdir_cmd = privilege.wrap(&format!("mkdir -p {}", shell_quote(install_dir)));
+    run_command(handle, &mkdir_cmd, privilege.stdin(), tx)
+        .await
+        .map_err(DeployError::Retryable)?;
+
+    upload_script(handle, &script_path, UNINSTALL_SCRIPT, privilege, tx)
+        .await
+        .map_err(DeployError::Retryable)?;
+
+    // —— 阶段 3：卸载 ——
+    let _ = tx
+        .send(DeployEvent::Progress {
+            step: DeployStep::Uninstalling,
+            message: "执行卸载脚本 …".to_string(),
+        })
+        .await;
+
+    let uninstall_cmd = build_uninstall_command(request, &script_path, privilege);
+    run_command(handle, &uninstall_cmd, privilege.stdin(), tx)
+        .await
+        .map_err(DeployError::Retryable)?;
+
+    // —— 阶段 4：校验 ——
+    let _ = tx
+        .send(DeployEvent::Progress {
+            step: DeployStep::Verifying,
+            message: "校验卸载结果 …".to_string(),
+        })
+        .await;
+
+    let verify_cmd = build_uninstall_verify_command(install_dir, privilege);
+    run_command(handle, &verify_cmd, privilege.stdin(), tx)
+        .await
+        .map_err(DeployError::Retryable)?;
 
     Ok(())
 }
@@ -588,6 +712,49 @@ fn build_verify_command(service_name: &str, privilege: &Privilege) -> String {
     ))
 }
 
+/// 组装卸载命令：`uninstall.sh --yes --service-name … [--backup|--no-backup]
+/// [--keep-config] [--backup-dir …]`，所有参数值单引号转义。
+///
+/// `backup_dir` 为空时不传该参数，让远端脚本用默认备份目录。
+fn build_uninstall_command(
+    request: &DeployRequest,
+    script_path: &str,
+    privilege: &Privilege,
+) -> String {
+    let mut parts: Vec<String> = vec![
+        format!("bash {}", shell_quote(script_path)),
+        "--yes".to_string(),
+        format!("--service-name {}", shell_quote(&request.service_name)),
+    ];
+
+    parts.push(if request.backup {
+        "--backup".to_string()
+    } else {
+        "--no-backup".to_string()
+    });
+
+    if request.keep_config {
+        parts.push("--keep-config".to_string());
+    }
+    if let Some(backup_dir) = &request.backup_dir {
+        if !backup_dir.is_empty() {
+            parts.push(format!("--backup-dir {}", shell_quote(backup_dir)));
+        }
+    }
+
+    let inner = parts.join(" ");
+    privilege.wrap(&inner)
+}
+
+/// 卸载校验命令：安装目录里的可执行文件必须已消失。
+/// `--keep-config` 只保留 config.toml，可执行文件始终被删除，故该断言对所有分支成立。
+fn build_uninstall_verify_command(install_dir: &str, privilege: &Privilege) -> String {
+    privilege.wrap(&format!(
+        "test ! -e {}",
+        shell_quote(&format!("{}/os-watcher", install_dir.trim_end_matches('/')))
+    ))
+}
+
 /// 单引号转义：把值安全嵌入 POSIX shell 单引号串。
 /// `'` → `'\''`（闭合引号、转义单引号、重开引号）。
 fn shell_quote(value: &str) -> String {
@@ -681,6 +848,23 @@ fn validate_request(request: &DeployRequest) -> Result<()> {
     }
     if request.version.chars().any(|c| c.is_whitespace()) {
         bail!("版本号不能包含空白字符");
+    }
+
+    // backup_dir：仅在指定时校验，规则与 install_dir 一致（远端脚本会把它
+    // 写进 systemd 单元/路径，故同样挡掉引号、控制字符与 specifier 字符）。
+    if let Some(backup_dir) = &request.backup_dir {
+        if !backup_dir.starts_with('/') {
+            bail!("备份目录必须是绝对路径");
+        }
+        if backup_dir.contains(['\'', '"']) {
+            bail!("备份目录不能包含引号");
+        }
+        if backup_dir.chars().any(char::is_control) {
+            bail!("备份目录不能包含控制字符");
+        }
+        if backup_dir.contains('%') {
+            bail!("备份目录不能包含 systemd specifier 字符 %");
+        }
     }
 
     // peers：每项形如 host:port。
@@ -823,6 +1007,14 @@ impl LineBuffer {
 /// 部署时写到远端 `<install_dir>/deploy.sh`。
 const DEPLOY_SCRIPT: &str = include_str!("../deploy.sh");
 
+/// 内嵌的卸载脚本：编译期把仓库根的 uninstall.sh 打进二进制，
+/// 卸载时写到远端 `<install_dir>/uninstall.sh` 再执行。
+///
+/// 之所以嵌入而非调用远端自带脚本：远端节点的版本可能任意老，自带的卸载脚本
+/// 未必支持当前面板传的参数（甚至根本没有）。面板推一份「当前已知可用」的
+/// 脚本过去，卸载行为就只取决于面板版本，与节点安装时间无关。
+const UNINSTALL_SCRIPT: &str = include_str!("../uninstall.sh");
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +1036,17 @@ mod tests {
             version: "0.0.8".to_string(),
             repo: None,
             proxy: None,
+            action: DeployAction::Deploy,
+            backup: false,
+            keep_config: false,
+            backup_dir: None,
+        }
+    }
+
+    fn uninstall_request() -> DeployRequest {
+        DeployRequest {
+            action: DeployAction::Uninstall,
+            ..base_request()
         }
     }
 
@@ -896,6 +1099,57 @@ mod tests {
 
         assert_eq!(request.port, 0);
         assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn omitted_action_defaults_to_deploy() {
+        let json = r#"{
+            "host": "192.168.1.50",
+            "username": "root",
+            "auth": {"type": "password", "password": "dummy"}
+        }"#;
+        let request = parse_request(
+            json,
+            &DeployConfig::default(),
+            "os-watcher",
+            "example/os-watcher",
+            "10.0.0.1:7979",
+        )
+        .expect("request without action should normalize");
+
+        assert_eq!(request.action, DeployAction::Deploy);
+        assert!(!request.backup);
+        assert!(!request.keep_config);
+        assert!(request.backup_dir.is_none());
+    }
+
+    #[test]
+    fn uninstall_action_carries_backup_options() {
+        let json = r#"{
+            "host": "192.168.1.50",
+            "username": "root",
+            "auth": {"type": "password", "password": "dummy"},
+            "action": "uninstall",
+            "backup": true,
+            "keep_config": true,
+            "backup_dir": "/var/backups/os-watcher"
+        }"#;
+        let request = parse_request(
+            json,
+            &DeployConfig::default(),
+            "os-watcher",
+            "example/os-watcher",
+            "10.0.0.1:7979",
+        )
+        .expect("uninstall request should normalize");
+
+        assert_eq!(request.action, DeployAction::Uninstall);
+        assert!(request.backup);
+        assert!(request.keep_config);
+        assert_eq!(
+            request.backup_dir.as_deref(),
+            Some("/var/backups/os-watcher")
+        );
     }
 
     #[test]
@@ -998,6 +1252,73 @@ mod tests {
         let cmd = build_verify_command("os-watcher", &Privilege::PasswordSudo("dummy".to_string()));
         assert!(cmd.contains("systemctl is-active --quiet 'os-watcher'"));
         assert!(cmd.starts_with("sudo -S -p ''"));
+    }
+
+    #[test]
+    fn uninstall_command_contains_expected_flags() {
+        let mut req = uninstall_request();
+        req.backup = true;
+        req.keep_config = true;
+        req.backup_dir = Some("/var/backups/x".to_string());
+        let cmd = build_uninstall_command(&req, "/opt/os-watcher/uninstall.sh", &Privilege::Root);
+
+        // 逐 token 断言，避免 `--backup` 命中 `--backup-dir` 的子串。
+        let tokens: Vec<&str> = cmd.split_whitespace().collect();
+        assert!(tokens.contains(&"bash"));
+        assert!(tokens.contains(&"--yes"));
+        assert!(tokens.contains(&"--service-name"));
+        assert!(tokens.contains(&"--backup"));
+        assert!(!tokens.contains(&"--no-backup"));
+        assert!(tokens.contains(&"--keep-config"));
+        assert!(tokens.contains(&"--backup-dir"));
+        assert!(cmd.contains("'/opt/os-watcher/uninstall.sh'"));
+        assert!(cmd.contains("'os-watcher'"));
+        assert!(cmd.contains("'/var/backups/x'"));
+    }
+
+    #[test]
+    fn uninstall_command_uses_no_backup_when_backup_disabled() {
+        let req = uninstall_request();
+        assert!(!req.backup);
+        let cmd = build_uninstall_command(&req, "/opt/os-watcher/uninstall.sh", &Privilege::Root);
+
+        let tokens: Vec<&str> = cmd.split_whitespace().collect();
+        assert!(tokens.contains(&"--no-backup"));
+        assert!(!tokens.contains(&"--backup"));
+        assert!(!tokens.contains(&"--keep-config"));
+        assert!(!tokens.contains(&"--backup-dir"));
+    }
+
+    #[test]
+    fn uninstall_command_escapes_service_name_quotes() {
+        let mut req = uninstall_request();
+        req.service_name = "it's".to_string();
+        let cmd = build_uninstall_command(&req, "/opt/os-watcher/uninstall.sh", &Privilege::Root);
+
+        // 值被拆成 'it'\''s'，单引号不会提前闭合字符串。
+        assert!(cmd.contains(r"'it'\''s'"));
+        assert!(!cmd.contains("'it's'"));
+        // 原始未转义的值不得出现在命令里——否则那个裸单引号就闭合了引号串。
+        assert!(!cmd.contains("it's"));
+    }
+
+    #[test]
+    fn uninstall_command_escalates_with_sudo_for_non_root() {
+        let mut req = uninstall_request();
+        req.username = "deployer".to_string();
+        let cmd = build_uninstall_command(
+            &req,
+            "/opt/os-watcher/uninstall.sh",
+            &Privilege::PasswordSudo("dummy".to_string()),
+        );
+
+        assert!(cmd.starts_with("sudo -S -p '' bash "));
+    }
+
+    #[test]
+    fn uninstall_verify_command_checks_executable_is_gone() {
+        let cmd = build_uninstall_verify_command("/opt/os-watcher/", &Privilege::Root);
+        assert_eq!(cmd, "test ! -e '/opt/os-watcher/os-watcher'");
     }
 
     #[test]
@@ -1104,6 +1425,41 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_relative_backup_dir() {
+        let mut req = uninstall_request();
+        req.backup_dir = Some("relative/path".to_string());
+        assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
+    fn validation_accepts_absolute_backup_dir() {
+        let mut req = uninstall_request();
+        req.backup_dir = Some("/var/backups/x".to_string());
+        assert!(validate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_backup_dir_with_quote() {
+        let mut req = uninstall_request();
+        req.backup_dir = Some("/var/backups/os'watcher".to_string());
+        assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_backup_dir_with_control_characters() {
+        let mut req = uninstall_request();
+        req.backup_dir = Some("/var/backups/x\nrm -rf /".to_string());
+        assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_backup_dir_with_systemd_specifier() {
+        let mut req = uninstall_request();
+        req.backup_dir = Some("/var/backups/%n".to_string());
+        assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
     fn validation_rejects_peer_with_systemd_specifier() {
         let mut req = base_request();
         req.peers = vec!["node-%n.example:7979".to_string()];
@@ -1186,6 +1542,16 @@ mod tests {
         assert_eq!(json["type"], "progress");
         assert_eq!(json["step"], "connecting");
         assert_eq!(json["message"], "hi");
+    }
+
+    #[test]
+    fn uninstalling_step_serializes_lowercase() {
+        let ev = DeployEvent::Progress {
+            step: DeployStep::Uninstalling,
+            message: "hi".to_string(),
+        };
+        let json = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(json["step"], "uninstalling");
     }
 
     #[test]

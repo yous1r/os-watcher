@@ -70,8 +70,10 @@ export function AddNodeDialog(props: {
   onDeployed?: () => void;
 }) {
   // 若已有进行中/未确认的部署，重新打开时直接落到第四步展示它。
+  // store 是部署与卸载共用的单例，这里必须限定 action，否则远程卸载的结果
+  // 会被当成部署进度显示。
   const [step, setStep] = createSignal<WizardStep>(
-    deployStore.isActive() ? 4 : 1
+    deployStore.isActive() && deployStore.action() === "deploy" ? 4 : 1
   );
 
   // 第一步：SSH 连接
@@ -235,6 +237,7 @@ export function AddNodeDialog(props: {
           };
     const peerList = splitPeers(peers());
     return {
+      action: "deploy",
       host: host().trim(),
       port: Number(port()),
       username: username().trim(),
@@ -266,6 +269,10 @@ export function AddNodeDialog(props: {
   };
 
   const startDeploy = () => {
+    // store 是单例：有远程任务正在跑（含远程卸载）时不能再发起部署，
+    // 否则进度面板会显示别人的状态。终态（成功/失败）不阻塞——start 会
+    // 覆盖它，用户也可能正是想接着发起一次新的部署。
+    if (deployStore.isRunning()) return;
     const issue = validateStep1() ?? validateStep2();
     if (issue) return showValidationIssue(issue);
     clearValidation();
@@ -588,6 +595,13 @@ export function AddNodeDialog(props: {
           </div>
         </Show>
 
+        {/* store 是单例：有远程任务正在跑时不允许再发起部署 */}
+        <Show when={step() < 4 && deployStore.isRunning()}>
+          <div class="deploy-hint">
+            已有进行中的远程任务，完成或中止后才能发起新的部署。
+          </div>
+        </Show>
+
         <Show when={validationError()}>
           {(message) => (
             <div
@@ -654,7 +668,12 @@ export function AddNodeDialog(props: {
             </button>
           </Show>
           <Show when={step() === 3}>
-            <button type="button" class="btn-primary" onClick={startDeploy}>
+            <button
+              type="button"
+              class="btn-primary"
+              disabled={deployStore.isRunning()}
+              onClick={startDeploy}
+            >
               开始部署
             </button>
           </Show>

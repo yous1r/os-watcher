@@ -24,6 +24,12 @@
 #   -h, --help              显示帮助
 #
 # 说明：卸载会停止并注销 systemd 服务、删除安装目录，不可撤销。
+#
+# 远程卸载：本脚本也可由 Web 面板远程推送执行——面板把脚本上传到请求指定的
+# 安装目录内再运行，因此安装目录以脚本自身所在目录为准（与 deploy.sh 一致）。
+# 执行前会校验该目录：既不是系统目录（/、/etc、/usr、/var、/home 等），也确实
+# 像 os-watcher 的安装目录（存在 os-watcher、os-watcher.exe 或 config.toml
+# 之一）。目录填错时直接拒绝，避免把系统目录当成安装目录删空。
 
 set -Eeuo pipefail
 
@@ -34,6 +40,9 @@ KEEP_CONFIG=0
 ASSUME_YES=0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# usage() 要重新读脚本自身，而下面的 `cd /` 会让相对路径失效（`./uninstall.sh --help`
+# 会因读不到文件而报 sed 错误）。这里先解析成绝对路径。
+SCRIPT_PATH="$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
 
 # 离开安装目录：Linux 不允许删除任何进程的当前工作目录，而文档里的用法正是
 # `cd <安装目录> && sudo ./uninstall.sh`，停在目录里会让最后一步 rmdir 失败，
@@ -47,7 +56,7 @@ c_err() { printf '\033[31m[FAIL]\033[0m %s\n' "$*" >&2; }
 fail() { c_err "$*"; exit 1; }
 
 usage() {
-  sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,32p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -96,6 +105,27 @@ refuse_on_windows() {
   if is_windows; then
     fail "Windows 请运行 uninstall.cmd（或 uninstall.ps1），本脚本只处理 Linux"
   fi
+}
+
+# 面板远程卸载时安装目录来自请求里的 install_dir：面板把脚本上传到该目录内再执行，
+# 所以 $SCRIPT_DIR 完全来自外部输入。填错（/、/etc、/usr、家目录……）会让下面的
+# 删除循环清空那个目录，因此这里硬性拦住：系统目录一律拒绝，且目录必须真的像
+# os-watcher 安装目录（有可执行文件或配置之一）才继续。
+verify_install_dir() {
+  case "$SCRIPT_DIR" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+      fail "拒绝卸载：$SCRIPT_DIR 是系统目录，不是 os-watcher 安装目录；请检查面板请求里的 install_dir"
+      ;;
+  esac
+
+  local marker
+  for marker in os-watcher os-watcher.exe config.toml; do
+    if [[ -e "$SCRIPT_DIR/$marker" ]]; then
+      return 0
+    fi
+  done
+
+  fail "拒绝卸载：目录不像 os-watcher 安装（$SCRIPT_DIR 下没有 os-watcher、os-watcher.exe 或 config.toml）；请检查面板请求里的 install_dir"
 }
 
 stop_and_remove_service() {
@@ -190,6 +220,7 @@ main() {
   [[ -n "$SERVICE_NAME" ]] || fail "--service-name 不能为空"
   validate_service_name
   refuse_on_windows
+  verify_install_dir
   require_privilege
   c_info "安装目录：$SCRIPT_DIR"
 
