@@ -282,7 +282,7 @@ async fn run(cli: Cli) -> Result<()> {
                 keep_config,
                 backup_dir,
             };
-            uninstall::run_uninstall(&options)?;
+            uninstall::run_uninstall(&options).await?;
         }
 
         Commands::Start {

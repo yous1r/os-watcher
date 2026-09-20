@@ -220,16 +220,23 @@ pub fn schedule_reboot_removal(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-/// Back up (when asked) and remove the tree, in this process.
+/// Back up (when asked), stop the service and remove the tree, in this process.
 ///
 /// A failed backup aborts before anything is deleted: losing the operator's
-/// config is worse than a half-finished uninstall.
-pub fn run_uninstall(options: &UninstallOptions) -> Result<UninstallOutcome> {
+/// config is worse than a half-finished uninstall. The service is only stopped
+/// once the backup is safe, so a failed backup never costs an outage either.
+pub async fn run_uninstall(options: &UninstallOptions) -> Result<UninstallOutcome> {
     let backup_dir = if options.backup {
         backup_config(&options.install_dir, &options.resolved_backup_dir())?
     } else {
         None
     };
+
+    // The helper runs in its own unit (`systemd-run --collect`), so stopping
+    // the agent's service does not take the helper down with it.
+    if let Err(error) = stop_and_remove_service(&options.service_name).await {
+        warn!("could not fully unregister the service: {error:#}");
+    }
 
     let (kept, pending) = remove_install_tree(&options.install_dir, options.keep_config)?;
     if !pending.is_empty() {
@@ -268,6 +275,12 @@ pub async fn stop_and_remove_service(service_name: &str) -> Result<()> {
             .arg("daemon-reload")
             .status()
             .await;
+        // `uninstall.sh` does the same: a unit that failed while running would
+        // otherwise linger in `failed` state and confuse a later reinstall.
+        let _ = tokio::process::Command::new("systemctl")
+            .args(["reset-failed", service_name])
+            .status()
+            .await;
         Ok(())
     }
 
@@ -296,6 +309,7 @@ pub async fn stop_and_remove_service(service_name: &str) -> Result<()> {
 }
 
 /// Arguments for the Linux `uninstall-helper` subcommand.
+#[cfg(target_os = "linux")]
 fn helper_args(options: &UninstallOptions) -> Vec<String> {
     let mut args = vec![
         "uninstall-helper".to_string(),
@@ -630,16 +644,23 @@ mod tests {
         assert!(!dir.exists(), "a leftover dotfile must not keep the tree alive");
     }
 
-    #[test]
-    fn a_failed_backup_leaves_the_installation_untouched() {
+    /// The service name is a sentinel that no host has registered: `run_uninstall`
+    /// stops the service it is given, and a test must never touch a real one.
+    const TEST_SERVICE: &str = "os-watcher-uninstall-test";
+
+    #[tokio::test]
+    async fn a_failed_backup_leaves_the_installation_untouched() {
         let (temp, dir) = temp_install();
         std::fs::write(dir.join("config.toml"), "[node]\n").expect("config should be written");
         // A file where the backup directory should go makes `create_dir_all` fail.
         let blocked = temp.path().join("blocked");
         std::fs::write(&blocked, "not a directory").expect("blocker should be written");
 
-        let options = UninstallOptions::new(dir.clone(), "os-watcher", true, false, Some(blocked));
-        let error = run_uninstall(&options).expect_err("a failed backup must abort");
+        let options =
+            UninstallOptions::new(dir.clone(), TEST_SERVICE, true, false, Some(blocked));
+        let error = run_uninstall(&options)
+            .await
+            .expect_err("a failed backup must abort");
 
         assert!(format!("{error:#}").contains("create backup directory"));
         assert!(
@@ -648,29 +669,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_successful_run_reports_the_backup_location() {
+    #[tokio::test]
+    async fn a_successful_run_reports_the_backup_location() {
         let (temp, dir) = temp_install();
         std::fs::write(dir.join("config.toml"), "[node]\n").expect("config should be written");
         std::fs::write(dir.join("os-watcher"), "binary").expect("binary should be written");
         let backup = temp.path().join("backup");
 
-        let options =
-            UninstallOptions::new(dir.clone(), "os-watcher", true, false, Some(backup.clone()));
-        let outcome = run_uninstall(&options).expect("uninstall should succeed");
+        let options = UninstallOptions::new(
+            dir.clone(),
+            TEST_SERVICE,
+            true,
+            false,
+            Some(backup.clone()),
+        );
+        let outcome = run_uninstall(&options).await.expect("uninstall should succeed");
 
         assert_eq!(outcome.backup_dir.as_deref(), Some(backup.as_path()));
         assert!(backup.join("config.toml").is_file());
         assert!(!dir.exists());
     }
 
-    #[test]
-    fn skipping_the_backup_removes_the_config_with_the_tree() {
+    #[tokio::test]
+    async fn skipping_the_backup_removes_the_config_with_the_tree() {
         let (_temp, dir) = temp_install();
         std::fs::write(dir.join("config.toml"), "[node]\n").expect("config should be written");
 
-        let options = UninstallOptions::new(dir.clone(), "os-watcher", false, false, None);
-        let outcome = run_uninstall(&options).expect("uninstall should succeed");
+        let options = UninstallOptions::new(dir.clone(), TEST_SERVICE, false, false, None);
+        let outcome = run_uninstall(&options).await.expect("uninstall should succeed");
 
         assert_eq!(outcome.backup_dir, None);
         assert!(!dir.exists());

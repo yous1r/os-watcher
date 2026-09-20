@@ -163,7 +163,8 @@ Content-Type: application/json
 设计要点：
 
 - **必须用脱离进程执行**。Windows 不允许删除正在运行的可执行文件，Linux 上停掉服务也会连带杀死服务进程的子进程。Windows 经 WMI `Win32_Process Create` 拉起 PowerShell（脚本以 base64 UTF-16LE 的 `-EncodedCommand` 传递，不落盘），Linux 用 `systemd-run --collect` 给 helper 单独分配 unit，使其不受 `systemctl stop` 影响。
-- **备份失败即中止**，一个文件都不删；默认只备份 `config.toml`。
+- **备份失败即中止**，一个文件都不删；默认只备份 `config.toml`。服务停止排在备份之后：备份失败时既不删文件也不停服务，不会因一次失败的卸载造成停机。
+- **helper 自己停服务并注销**（Linux `systemctl stop/disable` + 删 unit + `daemon-reload` + `reset-failed`，Windows `sc.exe stop/delete`）。早期实现漏掉了这一步：面板触发的卸载删掉了文件，却把 systemd unit 留在已启用状态、进程仍在运行，重启后服务还会被拉起。卸载脚本走的是同一套顺序。
 - **备份目录默认在安装目录的同级**（`os-watcher-backup-<时间戳>`）。早期实现把它放在安装目录内，会被同一次卸载删除——这是实测发现的真实数据丢失缺陷。
 - **占用中的文件登记为重启时删除**：Windows 用 `MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)`。调用必须走 `IntPtr` 重载——PowerShell 把 `$null` 传给 `[string]` 参数时会 marshal 成空字符串而非 NULL 指针，删除语义要求真正的 NULL，否则静默失败（返回 `ERROR_PATH_NOT_FOUND` 且什么都不登记）。
 - **`keep_config` 时不登记安装目录**，否则重启清理会把用户明确要求保留的 `config.toml` 一并删掉。
