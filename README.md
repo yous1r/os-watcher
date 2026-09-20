@@ -15,6 +15,36 @@ os-watcher 是一个去中心化主机资源监控工具，提供节点采集、
 os-watcher --config config.toml reconcile-config --package full
 ```
 
+## 卸载
+
+各平台的卸载脚本随发布包一起分发，放在安装目录内，用**本平台自己的入口**执行：
+
+| 平台 | 入口 | 说明 |
+| --- | --- | --- |
+| Linux | `sudo ./uninstall.sh` | 纯 shell 实现；在 Windows 上运行会直接报错并指向 `uninstall.cmd` |
+| Windows | `uninstall.cmd`（或 `uninstall.ps1`） | 纯 cmd / PowerShell 实现，非管理员会自动经 UAC 提权 |
+
+Windows 不要用 Git Bash 跑 `uninstall.sh`：它只处理 Linux，检测到 Windows 会拒绝执行。
+
+常用选项（两平台同名，写法按各自惯例）：
+
+| 用途 | Linux | Windows |
+| --- | --- | --- |
+| 跳过交互确认 | `--yes` / `-y` | `-Yes` |
+| 不备份 | `--no-backup` | `-NoBackup` |
+| 保留配置 | `--keep-config` | `-KeepConfig` |
+| 指定备份目录 | `--backup-dir DIR` | `-BackupDir DIR` |
+| 指定服务名 | `--service-name NAME` | `-ServiceName NAME` |
+
+行为约定：
+
+- **默认只备份 `config.toml`**（含口令、推送渠道与节点拓扑，重装后可直接复用）。数据库 `os-watcher.db`（可能数百 MB）与 `web-dist` 不备份，需要时请手工拷贝。
+- 备份默认落在**安装目录的同级** `os-watcher-backup-<时间戳>/`。备份必须在安装目录之外——放在目录内会被同一次卸载一并删掉。
+- 卸载顺序是「确认 → 备份 → 停服务 → 删文件」。**备份失败即中止**，不会删除任何文件。
+- 被占用的文件（Windows 上正在运行的 `os-watcher.exe`、被日志句柄占用的文件、以及脚本自身）无法立即删除，会登记为**下次重启时删除**；`--keep-config` 时安装目录本身不会被登记，否则会连保留的配置一起删掉。
+
+面板顶栏也提供「卸载」按钮，需要管理员登录；未登录返回 401，`[auth]` 开启但未设口令返回 503。面板触发的卸载与脚本等价，同样会登记重启清理。
+
 
 ## 安全警告
 

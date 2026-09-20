@@ -124,6 +124,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/os-watcher" "$DIST/"
           cp README.md          "$DIST/" 2>/dev/null || true
           cp deploy.sh          "$DIST/" 2>/dev/null || true
+          cp uninstall.sh       "$DIST/" 2>/dev/null || true
           cp config.node.example.toml "$DIST/config.example.toml"
           tar -czf "${DIST}.tar.gz" "$DIST"
           sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
@@ -136,6 +137,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/os-watcher" "$DIST/"
           cp README.md          "$DIST/" 2>/dev/null || true
           cp deploy.sh          "$DIST/" 2>/dev/null || true
+          cp uninstall.sh       "$DIST/" 2>/dev/null || true
           cp config.full.example.toml "$DIST/config.example.toml"
           cp -r web/dist        "$DIST/web-dist"
           tar -czf "${DIST}.tar.gz" "$DIST"

@@ -131,6 +131,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/os-watcher" "$DIST/"
           cp README.md     "$DIST/" 2>/dev/null || true
           cp deploy.sh     "$DIST/" 2>/dev/null || true
+          cp uninstall.sh  "$DIST/" 2>/dev/null || true
           cp config.node.example.toml "$DIST/config.example.toml"
           tar -czf "${DIST}.tar.gz" "$DIST"
           sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
@@ -143,6 +144,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/os-watcher" "$DIST/"
           cp README.md     "$DIST/" 2>/dev/null || true
           cp deploy.sh     "$DIST/" 2>/dev/null || true
+          cp uninstall.sh  "$DIST/" 2>/dev/null || true
           cp config.full.example.toml "$DIST/config.example.toml"
           cp -r web/dist   "$DIST/web-dist"
           tar -czf "${DIST}.tar.gz" "$DIST"
@@ -201,6 +203,8 @@ jobs:
           if (Test-Path deploy.sh) { Copy-Item deploy.sh "$dist\" }
           if (Test-Path deploy.ps1) { Copy-Item deploy.ps1 "$dist\" }
           if (Test-Path deploy.cmd) { Copy-Item deploy.cmd "$dist\" }
+          if (Test-Path uninstall.ps1) { Copy-Item uninstall.ps1 "$dist\" }
+          if (Test-Path uninstall.cmd) { Copy-Item uninstall.cmd "$dist\" }
           Copy-Item config.node.example.toml "$dist\config.example.toml"
           Compress-Archive -Path $dist -DestinationPath "$dist.zip"
           $hash = (Get-FileHash "$dist.zip" -Algorithm SHA256).Hash.ToLower()
@@ -216,6 +220,8 @@ jobs:
           if (Test-Path deploy.sh) { Copy-Item deploy.sh "$dist\" }
           if (Test-Path deploy.ps1) { Copy-Item deploy.ps1 "$dist\" }
           if (Test-Path deploy.cmd) { Copy-Item deploy.cmd "$dist\" }
+          if (Test-Path uninstall.ps1) { Copy-Item uninstall.ps1 "$dist\" }
+          if (Test-Path uninstall.cmd) { Copy-Item uninstall.cmd "$dist\" }
           Copy-Item config.full.example.toml "$dist\config.example.toml"
           Copy-Item web\dist "$dist\web-dist" -Recurse
           Compress-Archive -Path $dist -DestinationPath "$dist.zip"

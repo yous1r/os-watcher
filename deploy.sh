@@ -266,7 +266,16 @@ install_payload() {
     chmod 0755 "$SCRIPT_DIR/$bin_name"
   fi
 
-  for item in README.md deploy.sh deploy.ps1 deploy.cmd config.example.toml; do
+  # 只装本平台用得上的脚本：Windows 上跑的是 deploy.ps1/uninstall.ps1，
+  # Linux 上跑的是 deploy.sh/uninstall.sh。装错平台的脚本只会误导用户。
+  local payload
+  if is_windows; then
+    payload=(README.md deploy.sh deploy.ps1 deploy.cmd uninstall.ps1 uninstall.cmd config.example.toml)
+  else
+    payload=(README.md deploy.sh uninstall.sh config.example.toml)
+  fi
+
+  for item in "${payload[@]}"; do
     if [[ -f "$root/$item" ]]; then
       # Windows 会拒绝覆盖正在被占用的文件（脚本自身就是这种）。这些只是
       # 附带的脚本与文档，失败不该中断整个安装。

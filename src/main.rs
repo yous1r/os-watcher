@@ -15,6 +15,7 @@ mod state;
 mod storage;
 mod tui;
 mod types;
+mod uninstall;
 mod upgrade;
 
 use anyhow::{anyhow, Context, Result};
@@ -126,6 +127,22 @@ enum Commands {
         target_version: String,
         #[arg(long)]
         package: String,
+    },
+    /// Internal helper that removes the installation after the agent exits.
+    #[command(hide = true)]
+    UninstallHelper {
+        #[arg(long)]
+        install_dir: PathBuf,
+        #[arg(long)]
+        service_name: String,
+        /// Back up `config.toml` before removing the tree
+        #[arg(long)]
+        backup: bool,
+        /// Keep `config.toml` instead of deleting it
+        #[arg(long)]
+        keep_config: bool,
+        #[arg(long)]
+        backup_dir: Option<PathBuf>,
     },
 }
 
@@ -246,6 +263,26 @@ async fn run(cli: Cli) -> Result<()> {
                 package,
             })
             .await?;
+        }
+
+        Commands::UninstallHelper {
+            install_dir,
+            service_name,
+            backup,
+            keep_config,
+            backup_dir,
+        } => {
+            // Only reached on Linux: there the helper is this binary, since
+            // unlinking a running executable is allowed. Windows uses a
+            // detached PowerShell script instead.
+            let options = uninstall::UninstallOptions {
+                install_dir,
+                service_name,
+                backup,
+                keep_config,
+                backup_dir,
+            };
+            uninstall::run_uninstall(&options)?;
         }
 
         Commands::Start {

@@ -285,6 +285,20 @@ export type DeployAuth =
   | { type: "password"; password: string }
   | { type: "key"; private_key: string; passphrase: string | null };
 
+/** 卸载请求：是否备份 config.toml、是否保留它。 */
+export interface UninstallRequest {
+  backup: boolean;
+  keep_config: boolean;
+}
+
+/** 卸载已被接受；服务随后停止，故没有完成状态可轮询。 */
+export interface UninstallResult {
+  scheduled: boolean;
+  backup: boolean;
+  keep_config: boolean;
+  message: string;
+}
+
 /** 部署请求首帧，通过 WebSocket 发送给后端。 */
 export interface DeployRequest {
   host: string;

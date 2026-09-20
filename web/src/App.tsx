@@ -15,6 +15,7 @@ import { NodeDetail } from "./views/NodeDetail";
 import { Alerts } from "./views/Alerts";
 import { NotifySettings } from "./views/NotifySettings";
 import { AddNodeDialog } from "./views/AddNodeDialog";
+import { UninstallDialog } from "./views/UninstallDialog";
 import { LoginDialog } from "./views/LoginDialog";
 import { deployStore } from "./deployStore";
 import { authStore } from "./authStore";
@@ -25,6 +26,7 @@ export default function App() {
   const [connected, setConnected] = createSignal<boolean | null>(null);
   const [lastUpdate, setLastUpdate] = createSignal("--:--:--");
   const [addNodeOpen, setAddNodeOpen] = createSignal(false);
+  const [uninstallOpen, setUninstallOpen] = createSignal(false);
 
   // 轮询触发器：每个刷新周期递增，驱动 createResource 重新拉取。
   const [tick, setTick] = createSignal(0);
@@ -205,6 +207,17 @@ export default function App() {
                 ? "部署结果"
                 : "+ 添加节点"}
           </button>
+          <button
+            type="button"
+            class="add-node-btn uninstall-btn"
+            title={!authStore.canManage() ? "需要管理员登录" : "卸载本机 os-watcher"}
+            onClick={() => {
+              if (!authStore.allowed()) return;
+              setUninstallOpen(true);
+            }}
+          >
+            卸载
+          </button>
         </div>
       </header>
 
@@ -261,6 +274,10 @@ export default function App() {
           onClose={() => setAddNodeOpen(false)}
           onDeployed={() => setTick((t) => t + 1)}
         />
+      </Show>
+
+      <Show when={uninstallOpen()}>
+        <UninstallDialog onClose={() => setUninstallOpen(false)} />
       </Show>
 
       <Show when={authStore.loginOpen()}>

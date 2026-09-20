@@ -221,7 +221,9 @@ function Install-Payload([string]$Root, [string]$BinName) {
 
     Copy-Item -LiteralPath $sourceExe -Destination (Join-Path $ScriptDir $BinName) -Force
 
-    foreach ($item in @('README.md', 'deploy.sh', 'deploy.ps1', 'deploy.cmd', 'config.example.toml')) {
+    # Windows 上卸载/部署只用 cmd 与 PowerShell：不带 uninstall.sh，
+    # 避免在 Windows 机器上引导用户去跑 bash 脚本。
+    foreach ($item in @('README.md', 'deploy.ps1', 'deploy.cmd', 'uninstall.ps1', 'uninstall.cmd', 'config.example.toml')) {
         $src = Join-Path $Root $item
         if (Test-Path -LiteralPath $src -PathType Leaf) {
             Copy-Item -LiteralPath $src -Destination (Join-Path $ScriptDir $item) -Force

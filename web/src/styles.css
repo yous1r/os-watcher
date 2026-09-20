@@ -1226,6 +1226,18 @@ body {
   background: rgba(210, 153, 34, 0.22);
 }
 
+/* 卸载入口：与「添加节点」同形，但用危险色，避免误点。 */
+.uninstall-btn {
+  margin-left: 8px;
+  border-color: var(--crit);
+  background: rgba(248, 81, 73, 0.1);
+  color: var(--crit);
+}
+
+.uninstall-btn:hover {
+  background: rgba(248, 81, 73, 0.2);
+}
+
 /* ---------- 添加节点向导 ---------- */
 .add-node-dialog {
   width: min(560px, 100%);

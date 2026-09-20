@@ -147,6 +147,29 @@ Content-Type: application/json
 
 `package` 和 `proxy` 均可省略。已有升级任务时返回 `409 Conflict`，未启用升级时返回 `503 Service Unavailable`。
 
+## 卸载
+
+卸载接口：
+
+```http
+POST /api/v1/uninstall
+Content-Type: application/json
+
+{"backup":true,"keep_config":false}
+```
+
+`backup` 与 `keep_config` 均可省略（默认 `false`）。该接口需要管理员会话：未登录返回 `401 Unauthorized`；`[auth] enabled = true` 但未设置口令时返回 `503 Service Unavailable`，不会静默放行。响应先于实际删除返回，因此 `success: true` 只代表「卸载已排程」，面板据此提示节点即将离线。
+
+设计要点：
+
+- **必须用脱离进程执行**。Windows 不允许删除正在运行的可执行文件，Linux 上停掉服务也会连带杀死服务进程的子进程。Windows 经 WMI `Win32_Process Create` 拉起 PowerShell（脚本以 base64 UTF-16LE 的 `-EncodedCommand` 传递，不落盘），Linux 用 `systemd-run --collect` 给 helper 单独分配 unit，使其不受 `systemctl stop` 影响。
+- **备份失败即中止**，一个文件都不删；默认只备份 `config.toml`。
+- **备份目录默认在安装目录的同级**（`os-watcher-backup-<时间戳>`）。早期实现把它放在安装目录内，会被同一次卸载删除——这是实测发现的真实数据丢失缺陷。
+- **占用中的文件登记为重启时删除**：Windows 用 `MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)`。调用必须走 `IntPtr` 重载——PowerShell 把 `$null` 传给 `[string]` 参数时会 marshal 成空字符串而非 NULL 指针，删除语义要求真正的 NULL，否则静默失败（返回 `ERROR_PATH_NOT_FOUND` 且什么都不登记）。
+- **`keep_config` 时不登记安装目录**，否则重启清理会把用户明确要求保留的 `config.toml` 一并删掉。
+- **`uninstall.cmd` 自身不能立即删除**：cmd.exe 逐行读取批处理文件，删除它会以「系统找不到指定的路径」中止并丢掉退出码，故与脚本自身一样登记重启清理。
+- Windows 逻辑只用 cmd / PowerShell 实现；`uninstall.sh` 只处理 Linux，检测到 Windows 会拒绝执行并指向 `uninstall.cmd`。
+
 ## 安全边界
 
 本版本按需求不加入登录认证，也不做节点侧鉴权。安全边界依赖部署网络、反向代理、系统防火墙或内网访问控制。UI 弹窗只用于降低误操作风险，不作为安全机制。

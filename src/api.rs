@@ -301,6 +301,72 @@ async fn health_check() -> impl IntoResponse {
     }))
 }
 
+/// Request body for `POST /api/v1/uninstall`.
+#[derive(Debug, Deserialize)]
+struct UninstallRequestBody {
+    /// Back up `config.toml` before removing the installation.
+    #[serde(default)]
+    backup: bool,
+    /// Keep `config.toml` in place instead of deleting it.
+    #[serde(default)]
+    keep_config: bool,
+}
+
+/// POST /api/v1/uninstall — remove this installation.
+///
+/// Requires an admin session: this deletes the agent, its service registration
+/// and (unless kept) its configuration. The removal runs in a detached helper,
+/// because a process cannot delete its own binary on Windows; the response is
+/// therefore sent before anything is removed, and the panel must treat a
+/// successful reply as "the agent is going away".
+async fn post_uninstall(
+    State(api): State<ApiState>,
+    _admin: Admin,
+    Json(body): Json<UninstallRequestBody>,
+) -> impl IntoResponse {
+    let current_exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "无法定位当前可执行文件：{error}"
+            )))
+        }
+    };
+    let install_dir = match current_exe.parent() {
+        Some(dir) => dir.to_path_buf(),
+        None => {
+            return Err(ApiError::internal(
+                "当前可执行文件没有上级目录，无法确定安装目录",
+            ))
+        }
+    };
+
+    let options = crate::uninstall::UninstallOptions::new(
+        install_dir,
+        api.upgrade_config.service_name.clone(),
+        body.backup,
+        body.keep_config,
+        None,
+    );
+
+    if let Err(error) = crate::uninstall::spawn_detached_helper(&options) {
+        warn!("Failed to schedule uninstall: {error:#}");
+        return Err(ApiError::internal(format!("无法启动卸载程序：{error:#}")));
+    }
+
+    info!(
+        "Uninstall scheduled by an admin session (backup {}, keep_config {})",
+        body.backup, body.keep_config
+    );
+
+    Ok(ApiResponse::ok(serde_json::json!({
+        "scheduled": true,
+        "backup": body.backup,
+        "keep_config": body.keep_config,
+        "message": "卸载程序已启动，服务即将停止；如文件被占用将在下次重启时删除",
+    })))
+}
+
 /// GET /api/v1/nodes/deploy — 远程节点部署的 WebSocket 端点。
 ///
 /// 协议：客户端建连后发送一帧 [`DeployRequest`] JSON；服务端把部署过程的
@@ -723,6 +789,7 @@ pub fn create_router(api_state: ApiState, web_dir: Option<&str>) -> Router {
             "/api/v1/upgrade",
             get(get_upgrade_status).post(trigger_upgrade),
         )
+        .route("/api/v1/uninstall", post(post_uninstall))
         .route("/api/v1/nodes", get(list_nodes))
         .route("/api/v1/nodes/deploy", get(deploy_ws))
         .route("/api/v1/nodes/:node_id", get(get_node))

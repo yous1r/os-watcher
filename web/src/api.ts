@@ -7,6 +7,8 @@ import type {
   NotifyChannelPayload,
   NotifyDefaults,
   SessionInfo,
+  UninstallRequest,
+  UninstallResult,
   UpgradeRequest,
   UpgradeStatus,
   VersionInfo,
@@ -174,6 +176,14 @@ export function triggerNodeUpgrade(
   request: UpgradeRequest
 ): Promise<UpgradeStatus> {
   return postJson<UpgradeStatus>("/upgrade", request, apiBaseForNode(apiAddr));
+}
+
+/**
+ * 卸载本机安装。仅管理员可调用：后端会删除服务注册与安装目录。
+ * 请求成功即代表卸载程序已启动，服务随后停止，因此没有可轮询的完成状态。
+ */
+export function triggerUninstall(request: UninstallRequest): Promise<UninstallResult> {
+  return postJson<UninstallResult>("/uninstall", request);
 }
 
 /** 拉取指定节点的自升级状态。 */
